@@ -3,46 +3,49 @@ package shared
 import (
 	"context"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	"github.com/authzed/spicedb/internal/caveats"
-	"github.com/authzed/spicedb/internal/datastore/options"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/internal/namespace"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	caveatdiff "github.com/authzed/spicedb/pkg/diff/caveats"
+	nsdiff "github.com/authzed/spicedb/pkg/diff/namespace"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/compiler"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 	"github.com/authzed/spicedb/pkg/tuple"
-	"github.com/authzed/spicedb/pkg/util"
+	"github.com/authzed/spicedb/pkg/typesystem"
 )
 
 // ValidatedSchemaChanges is a set of validated schema changes that can be applied to the datastore.
 type ValidatedSchemaChanges struct {
-	compiled          *compiler.CompiledSchema
-	newCaveatDefNames *util.Set[string]
-	newObjectDefNames *util.Set[string]
-	additiveOnly      bool
+	compiled             *compiler.CompiledSchema
+	validatedTypeSystems map[string]*typesystem.ValidatedNamespaceTypeSystem
+	newCaveatDefNames    *mapz.Set[string]
+	newObjectDefNames    *mapz.Set[string]
+	additiveOnly         bool
 }
 
 // ValidateSchemaChanges validates the schema found in the compiled schema and returns a
 // ValidatedSchemaChanges, if fully validated.
 func ValidateSchemaChanges(ctx context.Context, compiled *compiler.CompiledSchema, additiveOnly bool) (*ValidatedSchemaChanges, error) {
 	// 1) Validate the caveats defined.
-	newCaveatDefNames := util.NewSet[string]()
+	newCaveatDefNames := mapz.NewSet[string]()
 	for _, caveatDef := range compiled.CaveatDefinitions {
 		if err := namespace.ValidateCaveatDefinition(caveatDef); err != nil {
 			return nil, err
 		}
 
-		newCaveatDefNames.Add(caveatDef.Name)
+		newCaveatDefNames.Insert(caveatDef.Name)
 	}
 
 	// 2) Validate the namespaces defined.
-	newObjectDefNames := util.NewSet[string]()
+	newObjectDefNames := mapz.NewSet[string]()
+	validatedTypeSystems := make(map[string]*typesystem.ValidatedNamespaceTypeSystem, len(compiled.ObjectDefinitions))
+
 	for _, nsdef := range compiled.ObjectDefinitions {
-		ts, err := namespace.NewNamespaceTypeSystem(nsdef,
-			namespace.ResolverForPredefinedDefinitions(namespace.PredefinedElements{
+		ts, err := typesystem.NewNamespaceTypeSystem(nsdef,
+			typesystem.ResolverForPredefinedDefinitions(typesystem.PredefinedElements{
 				Namespaces: compiled.ObjectDefinitions,
 				Caveats:    compiled.CaveatDefinitions,
 			}))
@@ -55,18 +58,16 @@ func ValidateSchemaChanges(ctx context.Context, compiled *compiler.CompiledSchem
 			return nil, err
 		}
 
-		if err := namespace.AnnotateNamespace(vts); err != nil {
-			return nil, err
-		}
-
-		newObjectDefNames.Add(nsdef.Name)
+		validatedTypeSystems[nsdef.Name] = vts
+		newObjectDefNames.Insert(nsdef.Name)
 	}
 
 	return &ValidatedSchemaChanges{
-		compiled:          compiled,
-		newCaveatDefNames: newCaveatDefNames,
-		newObjectDefNames: newObjectDefNames,
-		additiveOnly:      additiveOnly,
+		compiled:             compiled,
+		validatedTypeSystems: validatedTypeSystems,
+		newCaveatDefNames:    newCaveatDefNames,
+		newObjectDefNames:    newObjectDefNames,
+		additiveOnly:         additiveOnly,
 	}, nil
 }
 
@@ -74,29 +75,35 @@ func ValidateSchemaChanges(ctx context.Context, compiled *compiler.CompiledSchem
 type AppliedSchemaChanges struct {
 	// TotalOperationCount holds the total number of "dispatch" operations performed by the schema
 	// being applied.
-	TotalOperationCount uint32
+	TotalOperationCount int
 
 	// NewObjectDefNames contains the names of the newly added object definitions.
 	NewObjectDefNames []string
 
 	// RemovedObjectDefNames contains the names of the removed object definitions.
 	RemovedObjectDefNames []string
+
+	// NewCaveatDefNames contains the names of the newly added caveat definitions.
+	NewCaveatDefNames []string
+
+	// RemovedCaveatDefNames contains the names of the removed caveat definitions.
+	RemovedCaveatDefNames []string
 }
 
 // ApplySchemaChanges applies schema changes found in the validated changes struct, via the specified
 // ReadWriteTransaction.
 func ApplySchemaChanges(ctx context.Context, rwt datastore.ReadWriteTransaction, validated *ValidatedSchemaChanges) (*AppliedSchemaChanges, error) {
-	existingCaveats, err := rwt.ListCaveats(ctx)
+	existingCaveats, err := rwt.ListAllCaveats(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	existingObjectDefs, err := rwt.ListNamespaces(ctx)
+	existingObjectDefs, err := rwt.ListAllNamespaces(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return ApplySchemaChangesOverExisting(ctx, rwt, validated, existingCaveats, existingObjectDefs)
+	return ApplySchemaChangesOverExisting(ctx, rwt, validated, datastore.DefinitionsOf(existingCaveats), datastore.DefinitionsOf(existingObjectDefs))
 }
 
 // ApplySchemaChangesOverExisting applies schema changes found in the validated changes struct, against
@@ -110,17 +117,23 @@ func ApplySchemaChangesOverExisting(
 ) (*AppliedSchemaChanges, error) {
 	// Build a map of existing caveats to determine those being removed, if any.
 	existingCaveatDefMap := make(map[string]*core.CaveatDefinition, len(existingCaveats))
-	existingCaveatDefNames := util.NewSet[string]()
+	existingCaveatDefNames := mapz.NewSet[string]()
 
 	for _, existingCaveat := range existingCaveats {
 		existingCaveatDefMap[existingCaveat.Name] = existingCaveat
-		existingCaveatDefNames.Add(existingCaveat.Name)
+		existingCaveatDefNames.Insert(existingCaveat.Name)
 	}
 
 	// For each caveat definition, perform a diff and ensure the changes will not result in type errors.
+	caveatDefsWithChanges := make([]*core.CaveatDefinition, 0, len(validated.compiled.CaveatDefinitions))
 	for _, caveatDef := range validated.compiled.CaveatDefinitions {
-		if err := sanityCheckCaveatChanges(ctx, rwt, caveatDef, existingCaveatDefMap); err != nil {
+		diff, err := sanityCheckCaveatChanges(ctx, rwt, caveatDef, existingCaveatDefMap)
+		if err != nil {
 			return nil, err
+		}
+
+		if len(diff.Deltas()) > 0 {
+			caveatDefsWithChanges = append(caveatDefsWithChanges, caveatDef)
 		}
 	}
 
@@ -128,10 +141,10 @@ func ApplySchemaChangesOverExisting(
 
 	// Build a map of existing definitions to determine those being removed, if any.
 	existingObjectDefMap := make(map[string]*core.NamespaceDefinition, len(existingObjectDefs))
-	existingObjectDefNames := util.NewSet[string]()
+	existingObjectDefNames := mapz.NewSet[string]()
 	for _, existingDef := range existingObjectDefs {
 		existingObjectDefMap[existingDef.Name] = existingDef
-		existingObjectDefNames.Add(existingDef.Name)
+		existingObjectDefNames.Insert(existingDef.Name)
 	}
 
 	// For each definition, perform a diff and ensure the changes will not result in any
@@ -145,6 +158,15 @@ func ApplySchemaChangesOverExisting(
 
 		if len(diff.Deltas()) > 0 {
 			objectDefsWithChanges = append(objectDefsWithChanges, nsdef)
+
+			vts, ok := validated.validatedTypeSystems[nsdef.Name]
+			if !ok {
+				return nil, spiceerrors.MustBugf("validated type system not found for namespace `%s`", nsdef.Name)
+			}
+
+			if err := namespace.AnnotateNamespace(vts); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -153,6 +175,7 @@ func ApplySchemaChangesOverExisting(
 		Int("objectDefinitions", len(validated.compiled.ObjectDefinitions)).
 		Int("caveatDefinitions", len(validated.compiled.CaveatDefinitions)).
 		Int("objectDefsWithChanges", len(objectDefsWithChanges)).
+		Int("caveatDefsWithChanges", len(caveatDefsWithChanges)).
 		Msg("validated namespace definitions")
 
 	// Ensure that deleting namespaces will not result in any relationships left without associated
@@ -166,10 +189,9 @@ func ApplySchemaChangesOverExisting(
 		}
 	}
 
-	// Write the new caveats.
-	// TODO(jschorr): Only write updated caveats once the diff has been changed to support expressions.
-	if len(validated.compiled.CaveatDefinitions) > 0 {
-		if err := rwt.WriteCaveats(ctx, validated.compiled.CaveatDefinitions); err != nil {
+	// Write the new/changes caveats.
+	if len(caveatDefsWithChanges) > 0 {
+		if err := rwt.WriteCaveats(ctx, caveatDefsWithChanges); err != nil {
 			return nil, err
 		}
 	}
@@ -200,52 +222,54 @@ func ApplySchemaChangesOverExisting(
 	log.Ctx(ctx).Trace().
 		Interface("objectDefinitions", validated.compiled.ObjectDefinitions).
 		Interface("caveatDefinitions", validated.compiled.CaveatDefinitions).
-		Object("addedOrChangedObjectDefinitions", util.StringSet(validated.newObjectDefNames)).
-		Object("removedObjectDefinitions", util.StringSet(removedObjectDefNames)).
-		Object("addedOrChangedCaveatDefinitions", util.StringSet(validated.newCaveatDefNames)).
-		Object("removedCaveatDefinitions", util.StringSet(removedCaveatDefNames)).
+		Object("addedOrChangedObjectDefinitions", validated.newObjectDefNames).
+		Object("removedObjectDefinitions", removedObjectDefNames).
+		Object("addedOrChangedCaveatDefinitions", validated.newCaveatDefNames).
+		Object("removedCaveatDefinitions", removedCaveatDefNames).
 		Msg("completed schema update")
 
 	return &AppliedSchemaChanges{
-		TotalOperationCount:   uint32(len(validated.compiled.ObjectDefinitions) + len(validated.compiled.CaveatDefinitions) + removedObjectDefNames.Len() + removedCaveatDefNames.Len()),
+		TotalOperationCount:   len(validated.compiled.ObjectDefinitions) + len(validated.compiled.CaveatDefinitions) + removedObjectDefNames.Len() + removedCaveatDefNames.Len(),
 		NewObjectDefNames:     validated.newObjectDefNames.Subtract(existingObjectDefNames).AsSlice(),
 		RemovedObjectDefNames: removedObjectDefNames.AsSlice(),
+		NewCaveatDefNames:     validated.newCaveatDefNames.Subtract(existingCaveatDefNames).AsSlice(),
+		RemovedCaveatDefNames: removedCaveatDefNames.AsSlice(),
 	}, nil
 }
 
 // sanityCheckCaveatChanges ensures that a caveat definition being written does not break
 // the types of the parameters that may already exist on relationships.
 func sanityCheckCaveatChanges(
-	ctx context.Context,
-	rwt datastore.ReadWriteTransaction,
+	_ context.Context,
+	_ datastore.ReadWriteTransaction,
 	caveatDef *core.CaveatDefinition,
 	existingDefs map[string]*core.CaveatDefinition,
-) error {
+) (*caveatdiff.Diff, error) {
 	// Ensure that the updated namespace does not break the existing tuple data.
 	existing := existingDefs[caveatDef.Name]
-	diff, err := caveats.DiffCaveats(existing, caveatDef)
+	diff, err := caveatdiff.DiffCaveats(existing, caveatDef)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, delta := range diff.Deltas() {
 		switch delta.Type {
-		case caveats.RemovedParameter:
-			return status.Errorf(codes.InvalidArgument, "cannot remove parameter `%s` on caveat `%s`", delta.ParameterName, caveatDef.Name)
+		case caveatdiff.RemovedParameter:
+			return diff, NewSchemaWriteDataValidationError("cannot remove parameter `%s` on caveat `%s`", delta.ParameterName, caveatDef.Name)
 
-		case caveats.ParameterTypeChanged:
-			return status.Errorf(codes.InvalidArgument, "cannot change the type of parameter `%s` on caveat `%s`", delta.ParameterName, caveatDef.Name)
+		case caveatdiff.ParameterTypeChanged:
+			return diff, NewSchemaWriteDataValidationError("cannot change the type of parameter `%s` on caveat `%s`", delta.ParameterName, caveatDef.Name)
 		}
 	}
 
-	return nil
+	return diff, nil
 }
 
 // ensureNoRelationshipsExist ensures that no relationships exist within the namespace with the given name.
 func ensureNoRelationshipsExist(ctx context.Context, rwt datastore.ReadWriteTransaction, namespaceName string) error {
 	qy, qyErr := rwt.QueryRelationships(
 		ctx,
-		datastore.RelationshipsFilter{ResourceType: namespaceName},
+		datastore.RelationshipsFilter{OptionalResourceType: namespaceName},
 		options.WithLimit(options.LimitOne),
 	)
 	if err := errorIfTupleIteratorReturnsTuples(
@@ -260,14 +284,15 @@ func ensureNoRelationshipsExist(ctx context.Context, rwt datastore.ReadWriteTran
 
 	qy, qyErr = rwt.ReverseQueryRelationships(ctx, datastore.SubjectsFilter{
 		SubjectType: namespaceName,
-	}, options.WithReverseLimit(options.LimitOne))
-	if err := errorIfTupleIteratorReturnsTuples(
+	}, options.WithLimitForReverse(options.LimitOne))
+	err := errorIfTupleIteratorReturnsTuples(
 		ctx,
 		qy,
 		qyErr,
 		"cannot delete object definition `%s`, as a relationship references it",
 		namespaceName,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 
@@ -282,21 +307,57 @@ func sanityCheckNamespaceChanges(
 	rwt datastore.ReadWriteTransaction,
 	nsdef *core.NamespaceDefinition,
 	existingDefs map[string]*core.NamespaceDefinition,
-) (*namespace.Diff, error) {
+) (*nsdiff.Diff, error) {
 	// Ensure that the updated namespace does not break the existing tuple data.
 	existing := existingDefs[nsdef.Name]
-	diff, err := namespace.DiffNamespaces(existing, nsdef)
+	diff, err := nsdiff.DiffNamespaces(existing, nsdef)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, delta := range diff.Deltas() {
 		switch delta.Type {
-		case namespace.RemovedRelation:
+		case nsdiff.RemovedRelation:
+			// NOTE: We add the subject filters here to ensure the reverse relationship index is used
+			// by the datastores. As there is no index that has {namespace, relation} directly, but there
+			// *is* an index that has {subject_namespace, subject_relation, namespace, relation}, we can
+			// force the datastore to use the reverse index by adding the subject filters.
+			var previousRelation *core.Relation
+			for _, relation := range existing.Relation {
+				if relation.Name == delta.RelationName {
+					previousRelation = relation
+					break
+				}
+			}
+
+			if previousRelation == nil {
+				return nil, spiceerrors.MustBugf("relation `%s` not found in existing namespace definition", delta.RelationName)
+			}
+
+			subjectSelectors := make([]datastore.SubjectsSelector, 0, len(previousRelation.TypeInformation.AllowedDirectRelations))
+			for _, allowedType := range previousRelation.TypeInformation.AllowedDirectRelations {
+				if allowedType.GetRelation() == datastore.Ellipsis {
+					subjectSelectors = append(subjectSelectors, datastore.SubjectsSelector{
+						OptionalSubjectType: allowedType.Namespace,
+						RelationFilter: datastore.SubjectRelationFilter{
+							IncludeEllipsisRelation: true,
+						},
+					})
+				} else {
+					subjectSelectors = append(subjectSelectors, datastore.SubjectsSelector{
+						OptionalSubjectType: allowedType.Namespace,
+						RelationFilter: datastore.SubjectRelationFilter{
+							NonEllipsisRelation: allowedType.GetRelation(),
+						},
+					})
+				}
+			}
+
 			qy, qyErr := rwt.QueryRelationships(ctx, datastore.RelationshipsFilter{
-				ResourceType:             nsdef.Name,
-				OptionalResourceRelation: delta.RelationName,
-			})
+				OptionalResourceType:      nsdef.Name,
+				OptionalResourceRelation:  delta.RelationName,
+				OptionalSubjectsSelectors: subjectSelectors,
+			}, options.WithLimit(options.LimitOne))
 
 			err = errorIfTupleIteratorReturnsTuples(
 				ctx,
@@ -313,7 +374,7 @@ func sanityCheckNamespaceChanges(
 				RelationFilter: datastore.SubjectRelationFilter{
 					NonEllipsisRelation: delta.RelationName,
 				},
-			}, options.WithReverseLimit(options.LimitOne))
+			}, options.WithLimitForReverse(options.LimitOne))
 			err = errorIfTupleIteratorReturnsTuples(
 				ctx,
 				qy,
@@ -323,7 +384,7 @@ func sanityCheckNamespaceChanges(
 				return diff, err
 			}
 
-		case namespace.RelationAllowedTypeRemoved:
+		case nsdiff.RelationAllowedTypeRemoved:
 			var optionalSubjectIds []string
 			var relationFilter datastore.SubjectRelationFilter
 			optionalCaveatName := ""
@@ -340,26 +401,34 @@ func sanityCheckNamespaceChanges(
 				optionalCaveatName = delta.AllowedType.GetRequiredCaveat().CaveatName
 			}
 
-			qy, qyErr := rwt.QueryRelationships(
+			expirationOption := datastore.ExpirationFilterOptionNoExpiration
+			if delta.AllowedType.RequiredExpiration != nil {
+				expirationOption = datastore.ExpirationFilterOptionHasExpiration
+			}
+
+			qyr, qyrErr := rwt.QueryRelationships(
 				ctx,
 				datastore.RelationshipsFilter{
-					ResourceType:             nsdef.Name,
+					OptionalResourceType:     nsdef.Name,
 					OptionalResourceRelation: delta.RelationName,
-					OptionalSubjectsFilter: &datastore.SubjectsFilter{
-						SubjectType:        delta.AllowedType.Namespace,
-						OptionalSubjectIds: optionalSubjectIds,
-						RelationFilter:     relationFilter,
+					OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+						{
+							OptionalSubjectType: delta.AllowedType.Namespace,
+							OptionalSubjectIds:  optionalSubjectIds,
+							RelationFilter:      relationFilter,
+						},
 					},
-					OptionalCaveatName: optionalCaveatName,
+					OptionalCaveatName:       optionalCaveatName,
+					OptionalExpirationOption: expirationOption,
 				},
 				options.WithLimit(options.LimitOne),
 			)
 			err = errorIfTupleIteratorReturnsTuples(
 				ctx,
-				qy,
-				qyErr,
+				qyr,
+				qyrErr,
 				"cannot remove allowed type `%s` from relation `%s` in object definition `%s`, as a relationship exists with it",
-				namespace.SourceForAllowedRelation(delta.AllowedType), delta.RelationName, nsdef.Name)
+				typesystem.SourceForAllowedRelation(delta.AllowedType), delta.RelationName, nsdef.Name)
 			if err != nil {
 				return diff, err
 			}
@@ -370,18 +439,17 @@ func sanityCheckNamespaceChanges(
 
 // errorIfTupleIteratorReturnsTuples takes a tuple iterator and any error that was generated
 // when the original iterator was created, and returns an error if iterator contains any tuples.
-func errorIfTupleIteratorReturnsTuples(ctx context.Context, qy datastore.RelationshipIterator, qyErr error, message string, args ...interface{}) error {
+func errorIfTupleIteratorReturnsTuples(_ context.Context, qy datastore.RelationshipIterator, qyErr error, message string, args ...interface{}) error {
 	if qyErr != nil {
 		return qyErr
 	}
-	defer qy.Close()
 
-	if rt := qy.Next(); rt != nil {
-		if qy.Err() != nil {
-			return qy.Err()
+	for _, err := range qy {
+		if err != nil {
+			return err
 		}
-
-		return status.Errorf(codes.InvalidArgument, message, args...)
+		return NewSchemaWriteDataValidationError(message, args...)
 	}
+
 	return nil
 }

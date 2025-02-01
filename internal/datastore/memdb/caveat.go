@@ -7,8 +7,8 @@ import (
 	"github.com/hashicorp/go-memdb"
 
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-	"github.com/authzed/spicedb/pkg/util"
 )
 
 const tableCaveats = "caveats"
@@ -26,7 +26,7 @@ func (c *caveat) Unwrap() (*core.CaveatDefinition, error) {
 }
 
 func (r *memdbReader) ReadCaveatByName(_ context.Context, name string) (*core.CaveatDefinition, datastore.Revision, error) {
-	r.lockOrPanic()
+	r.mustLock()
 	defer r.Unlock()
 
 	tx, err := r.txSource()
@@ -60,8 +60,8 @@ func (r *memdbReader) readUnwrappedCaveatByName(tx *memdb.Txn, name string) (*co
 	return unwrapped, rev, nil
 }
 
-func (r *memdbReader) ListCaveats(_ context.Context, caveatNames ...string) ([]*core.CaveatDefinition, error) {
-	r.lockOrPanic()
+func (r *memdbReader) ListAllCaveats(_ context.Context) ([]datastore.RevisionedCaveat, error) {
+	r.mustLock()
 	defer r.Unlock()
 
 	tx, err := r.txSource()
@@ -69,30 +69,47 @@ func (r *memdbReader) ListCaveats(_ context.Context, caveatNames ...string) ([]*
 		return nil, err
 	}
 
-	var caveats []*core.CaveatDefinition
+	var caveats []datastore.RevisionedCaveat
 	it, err := tx.LowerBound(tableCaveats, indexID)
 	if err != nil {
 		return nil, err
 	}
 
-	setOfCaveats := util.NewSet(caveatNames...)
 	for foundRaw := it.Next(); foundRaw != nil; foundRaw = it.Next() {
 		rawCaveat := foundRaw.(*caveat)
-		if !setOfCaveats.IsEmpty() && !setOfCaveats.Has(rawCaveat.name) {
-			continue
-		}
 		definition, err := rawCaveat.Unwrap()
 		if err != nil {
 			return nil, err
 		}
-		caveats = append(caveats, definition)
+		caveats = append(caveats, datastore.RevisionedCaveat{
+			Definition:          definition,
+			LastWrittenRevision: rawCaveat.revision,
+		})
 	}
 
 	return caveats, nil
 }
 
-func (rwt *memdbReadWriteTx) WriteCaveats(ctx context.Context, caveats []*core.CaveatDefinition) error {
-	rwt.lockOrPanic()
+func (r *memdbReader) LookupCaveatsWithNames(ctx context.Context, caveatNames []string) ([]datastore.RevisionedCaveat, error) {
+	allCaveats, err := r.ListAllCaveats(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	allowedCaveatNames := mapz.NewSet[string]()
+	allowedCaveatNames.Extend(caveatNames)
+
+	toReturn := make([]datastore.RevisionedCaveat, 0, len(caveatNames))
+	for _, caveat := range allCaveats {
+		if allowedCaveatNames.Has(caveat.Definition.Name) {
+			toReturn = append(toReturn, caveat)
+		}
+	}
+	return toReturn, nil
+}
+
+func (rwt *memdbReadWriteTx) WriteCaveats(_ context.Context, caveats []*core.CaveatDefinition) error {
+	rwt.mustLock()
 	defer rwt.Unlock()
 	tx, err := rwt.txSource()
 	if err != nil {
@@ -102,7 +119,7 @@ func (rwt *memdbReadWriteTx) WriteCaveats(ctx context.Context, caveats []*core.C
 }
 
 func (rwt *memdbReadWriteTx) writeCaveat(tx *memdb.Txn, caveats []*core.CaveatDefinition) error {
-	caveatNames := util.NewSet[string]()
+	caveatNames := mapz.NewSet[string]()
 	for _, coreCaveat := range caveats {
 		if !caveatNames.Add(coreCaveat.Name) {
 			return fmt.Errorf("duplicate caveat %s", coreCaveat.Name)
@@ -123,8 +140,8 @@ func (rwt *memdbReadWriteTx) writeCaveat(tx *memdb.Txn, caveats []*core.CaveatDe
 	return nil
 }
 
-func (rwt *memdbReadWriteTx) DeleteCaveats(ctx context.Context, names []string) error {
-	rwt.lockOrPanic()
+func (rwt *memdbReadWriteTx) DeleteCaveats(_ context.Context, names []string) error {
+	rwt.mustLock()
 	defer rwt.Unlock()
 	tx, err := rwt.txSource()
 	if err != nil {

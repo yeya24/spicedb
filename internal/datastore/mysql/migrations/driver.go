@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"strings"
 
+	mysqlCommon "github.com/authzed/spicedb/internal/datastore/mysql/common"
+
+	"github.com/authzed/spicedb/pkg/datastore"
+
 	"github.com/authzed/spicedb/internal/datastore/common"
 
 	sq "github.com/Masterminds/squirrel"
 	sqlDriver "github.com/go-sql-driver/mysql"
 
-	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/migrate"
 )
 
@@ -35,20 +38,24 @@ type MySQLDriver struct {
 //
 // URI: [scheme://][user[:[password]]@]host[:port][/schema][?attribute1=value1&attribute2=value2...
 // See https://dev.mysql.com/doc/refman/8.0/en/connecting-using-uri-or-key-value-pairs.html
-func NewMySQLDriverFromDSN(url string, tablePrefix string) (*MySQLDriver, error) {
+func NewMySQLDriverFromDSN(url string, tablePrefix string, credentialsProvider datastore.CredentialsProvider) (*MySQLDriver, error) {
 	dbConfig, err := sqlDriver.ParseDSN(url)
 	if err != nil {
 		return nil, fmt.Errorf(errUnableToInstantiate, err)
 	}
 
-	db, err := sql.Open("mysql", dbConfig.FormatDSN())
+	err = mysqlCommon.MaybeAddCredentialsProviderHook(dbConfig, credentialsProvider)
 	if err != nil {
 		return nil, fmt.Errorf(errUnableToInstantiate, err)
 	}
-	err = sqlDriver.SetLogger(&log.Logger)
+
+	// Call NewConnector with the existing parsed configuration to preserve the BeforeConnect added by the CredentialsProvider
+	connector, err := sqlDriver.NewConnector(dbConfig)
 	if err != nil {
-		return nil, fmt.Errorf("unable to set logging to mysql driver: %w", err)
+		return nil, fmt.Errorf(errUnableToInstantiate, err)
 	}
+
+	db := sql.OpenDB(connector)
 	return NewMySQLDriverFromDB(db, tablePrefix), nil
 }
 
@@ -59,7 +66,7 @@ func NewMySQLDriverFromDB(db *sql.DB, tablePrefix string) *MySQLDriver {
 
 // revisionToColumnName generates the column name that will denote a given migration revision
 func revisionToColumnName(revision string) string {
-	return fmt.Sprintf("%s%s", migrationVersionColumnPrefix, revision)
+	return migrationVersionColumnPrefix + revision
 }
 
 func columnNameToRevision(columnName string) (string, bool) {
@@ -74,7 +81,7 @@ func columnNameToRevision(columnName string) (string, bool) {
 func (driver *MySQLDriver) Version(ctx context.Context) (string, error) {
 	query, args, err := sb.Select("*").From(driver.migrationVersion()).ToSql()
 	if err != nil {
-		return "", fmt.Errorf("unable to load driver migration revision: %w", err)
+		return "", fmt.Errorf("unable to generate query for revision: %w", err)
 	}
 
 	rows, err := driver.db.QueryContext(ctx, query, args...)
@@ -83,15 +90,15 @@ func (driver *MySQLDriver) Version(ctx context.Context) (string, error) {
 		if errors.As(err, &mysqlError) && mysqlError.Number == mysqlMissingTableErrorNumber {
 			return "", nil
 		}
-		return "", fmt.Errorf("unable to load driver migration revision: %w", err)
+		return "", fmt.Errorf("unable to query revision: %w", err)
 	}
 	defer common.LogOnError(ctx, rows.Close)
 	if rows.Err() != nil {
-		return "", fmt.Errorf("unable to load driver migration revision: %w", rows.Err())
+		return "", fmt.Errorf("unable to load revision row: %w", rows.Err())
 	}
 	cols, err := rows.Columns()
 	if err != nil {
-		return "", fmt.Errorf("failed to get columns: %w", err)
+		return "", fmt.Errorf("failed to get columns from revision row: %w", err)
 	}
 
 	for _, col := range cols {
@@ -125,17 +132,17 @@ func BeginTxFunc(ctx context.Context, db *sql.DB, txOptions *sql.TxOptions, f fu
 	if err != nil {
 		return err
 	}
-	defer common.LogOnError(ctx, tx.Rollback)
 
 	if err := f(tx); err != nil {
+		rerr := tx.Rollback()
+		if rerr != nil {
+			return errors.Join(err, rerr)
+		}
+
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-
-	return nil
+	return tx.Commit()
 }
 
 // WriteVersion overwrites the _meta_version_ column name which encodes the version

@@ -5,84 +5,86 @@ import (
 	"fmt"
 
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 
 	"github.com/authzed/spicedb/internal/sharederrors"
+	dispatch "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 )
 
-// ErrRequestCanceled occurs when a request has been canceled.
-type ErrRequestCanceled struct {
-	error
-}
-
-// NewRequestCanceledErr constructs a new request was canceled error.
-func NewRequestCanceledErr() error {
-	return ErrRequestCanceled{
-		error: errors.New("request canceled"),
-	}
-}
-
-// ErrCheckFailure occurs when check failed in some manner. Note this should not apply to
+// CheckFailureError occurs when check failed in some manner. Note this should not apply to
 // namespaces and relations not being found.
-type ErrCheckFailure struct {
+type CheckFailureError struct {
 	error
+}
+
+func (e CheckFailureError) Unwrap() error {
+	return e.error
 }
 
 // NewCheckFailureErr constructs a new check failed error.
 func NewCheckFailureErr(baseErr error) error {
-	return ErrCheckFailure{
+	return CheckFailureError{
 		error: fmt.Errorf("error performing check: %w", baseErr),
 	}
 }
 
-// ErrExpansionFailure occurs when expansion failed in some manner. Note this should not apply to
+// ExpansionFailureError occurs when expansion failed in some manner. Note this should not apply to
 // namespaces and relations not being found.
-type ErrExpansionFailure struct {
+type ExpansionFailureError struct {
 	error
+}
+
+func (e ExpansionFailureError) Unwrap() error {
+	return e.error
 }
 
 // NewExpansionFailureErr constructs a new expansion failed error.
 func NewExpansionFailureErr(baseErr error) error {
-	return ErrExpansionFailure{
+	return ExpansionFailureError{
 		error: fmt.Errorf("error performing expand: %w", baseErr),
 	}
 }
 
-// ErrAlwaysFail is returned when an internal error leads to an operation
+// AlwaysFailError is returned when an internal error leads to an operation
 // guaranteed to fail.
-type ErrAlwaysFail struct {
+type AlwaysFailError struct {
 	error
 }
 
 // NewAlwaysFailErr constructs a new always fail error.
 func NewAlwaysFailErr() error {
-	return ErrAlwaysFail{
+	return AlwaysFailError{
 		error: errors.New("always fail"),
 	}
 }
 
-// ErrRelationNotFound occurs when a relation was not found under a namespace.
-type ErrRelationNotFound struct {
+// RelationNotFoundError occurs when a relation was not found under a namespace.
+type RelationNotFoundError struct {
 	error
 	namespaceName string
 	relationName  string
 }
 
 // NamespaceName returns the name of the namespace in which the relation was not found.
-func (err ErrRelationNotFound) NamespaceName() string {
+func (err RelationNotFoundError) NamespaceName() string {
 	return err.namespaceName
 }
 
 // NotFoundRelationName returns the name of the relation not found.
-func (err ErrRelationNotFound) NotFoundRelationName() string {
+func (err RelationNotFoundError) NotFoundRelationName() string {
 	return err.relationName
 }
 
-func (err ErrRelationNotFound) MarshalZerologObject(e *zerolog.Event) {
+func (err RelationNotFoundError) MarshalZerologObject(e *zerolog.Event) {
 	e.Err(err.error).Str("namespace", err.namespaceName).Str("relation", err.relationName)
 }
 
 // DetailsMetadata returns the metadata for details for this error.
-func (err ErrRelationNotFound) DetailsMetadata() map[string]string {
+func (err RelationNotFoundError) DetailsMetadata() map[string]string {
 	return map[string]string{
 		"definition_name":             err.namespaceName,
 		"relation_or_permission_name": err.relationName,
@@ -91,39 +93,39 @@ func (err ErrRelationNotFound) DetailsMetadata() map[string]string {
 
 // NewRelationNotFoundErr constructs a new relation not found error.
 func NewRelationNotFoundErr(nsName string, relationName string) error {
-	return ErrRelationNotFound{
+	return RelationNotFoundError{
 		error:         fmt.Errorf("relation/permission `%s` not found under definition `%s`", relationName, nsName),
 		namespaceName: nsName,
 		relationName:  relationName,
 	}
 }
 
-var _ sharederrors.UnknownRelationError = ErrRelationNotFound{}
+var _ sharederrors.UnknownRelationError = RelationNotFoundError{}
 
-// ErrRelationMissingTypeInfo defines an error for when type information is missing from a relation
+// RelationMissingTypeInfoError defines an error for when type information is missing from a relation
 // during a lookup.
-type ErrRelationMissingTypeInfo struct {
+type RelationMissingTypeInfoError struct {
 	error
 	namespaceName string
 	relationName  string
 }
 
 // NamespaceName returns the name of the namespace in which the relation was found.
-func (err ErrRelationMissingTypeInfo) NamespaceName() string {
+func (err RelationMissingTypeInfoError) NamespaceName() string {
 	return err.namespaceName
 }
 
 // RelationName returns the name of the relation missing type information.
-func (err ErrRelationMissingTypeInfo) RelationName() string {
+func (err RelationMissingTypeInfoError) RelationName() string {
 	return err.relationName
 }
 
-func (err ErrRelationMissingTypeInfo) MarshalZerologObject(e *zerolog.Event) {
+func (err RelationMissingTypeInfoError) MarshalZerologObject(e *zerolog.Event) {
 	e.Err(err.error).Str("namespace", err.namespaceName).Str("relation", err.relationName)
 }
 
 // DetailsMetadata returns the metadata for details for this error.
-func (err ErrRelationMissingTypeInfo) DetailsMetadata() map[string]string {
+func (err RelationMissingTypeInfoError) DetailsMetadata() map[string]string {
 	return map[string]string{
 		"definition_name": err.namespaceName,
 		"relation_name":   err.relationName,
@@ -132,33 +134,80 @@ func (err ErrRelationMissingTypeInfo) DetailsMetadata() map[string]string {
 
 // NewRelationMissingTypeInfoErr constructs a new relation not missing type information error.
 func NewRelationMissingTypeInfoErr(nsName string, relationName string) error {
-	return ErrRelationMissingTypeInfo{
+	return RelationMissingTypeInfoError{
 		error:         fmt.Errorf("relation/permission `%s` under definition `%s` is missing type information", relationName, nsName),
 		namespaceName: nsName,
 		relationName:  relationName,
 	}
 }
 
-// ErrInvalidArgument occurs when a request sent has an invalid argument.
-type ErrInvalidArgument struct {
+// WildcardNotAllowedError occurs when a request sent has an invalid wildcard argument.
+type WildcardNotAllowedError struct {
 	error
+
+	fieldName string
 }
 
-// NewErrInvalidArgument constructs a request sent has an invalid argument.
-func NewErrInvalidArgument(baseErr error) error {
-	return ErrInvalidArgument{
-		error: baseErr,
+// GRPCStatus implements retrieving the gRPC status for the error.
+func (err WildcardNotAllowedError) GRPCStatus() *status.Status {
+	return spiceerrors.WithCodeAndDetails(
+		err,
+		codes.InvalidArgument,
+		spiceerrors.ForReason(
+			v1.ErrorReason_ERROR_REASON_WILDCARD_NOT_ALLOWED,
+			map[string]string{
+				"field": err.fieldName,
+			},
+		),
+	)
+}
+
+// NewWildcardNotAllowedErr constructs an error indicating that a wildcard was not allowed.
+func NewWildcardNotAllowedErr(message string, fieldName string) error {
+	return WildcardNotAllowedError{
+		error:     fmt.Errorf("invalid argument: %s", message),
+		fieldName: fieldName,
 	}
 }
 
-// ErrUnimplemented is returned when some functionality is not yet supported.
-type ErrUnimplemented struct {
+// UnimplementedError is returned when some functionality is not yet supported.
+type UnimplementedError struct {
 	error
 }
 
 // NewUnimplementedErr constructs a new unimplemented error.
 func NewUnimplementedErr(baseErr error) error {
-	return ErrUnimplemented{
+	return UnimplementedError{
 		error: baseErr,
 	}
+}
+
+func (e UnimplementedError) Unwrap() error {
+	return e.error
+}
+
+// InvalidCursorError is returned when a cursor is no longer valid.
+type InvalidCursorError struct {
+	error
+}
+
+// NewInvalidCursorErr constructs a new unimplemented error.
+func NewInvalidCursorErr(dispatchCursorVersion uint32, cursor *dispatch.Cursor) error {
+	return InvalidCursorError{
+		error: fmt.Errorf("the supplied cursor is no longer valid: found version %d, expected version %d", cursor.DispatchVersion, dispatchCursorVersion),
+	}
+}
+
+// GRPCStatus implements retrieving the gRPC status for the error.
+func (err InvalidCursorError) GRPCStatus() *status.Status {
+	return spiceerrors.WithCodeAndDetails(
+		err,
+		codes.InvalidArgument,
+		spiceerrors.ForReason(
+			v1.ErrorReason_ERROR_REASON_INVALID_CURSOR,
+			map[string]string{
+				"details": "cursor was used against an incompatible version of SpiceDB",
+			},
+		),
+	)
 }

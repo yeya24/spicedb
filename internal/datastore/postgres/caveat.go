@@ -5,17 +5,24 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 
 	sq "github.com/Masterminds/squirrel"
-	"github.com/jackc/pgx/v4"
 )
 
 var (
-	writeCaveat  = psql.Insert(tableCaveat).Columns(colCaveatName, colCaveatDefinition)
-	listCaveat   = psql.Select(colCaveatDefinition).From(tableCaveat).OrderBy(colCaveatName)
-	readCaveat   = psql.Select(colCaveatDefinition, colCreatedXid).From(tableCaveat)
+	writeCaveat = psql.Insert(tableCaveat).Columns(colCaveatName, colCaveatDefinition)
+	listCaveat  = psql.
+			Select(colCaveatDefinition, colCreatedXid).
+			From(tableCaveat).
+			OrderBy(colCaveatName)
+	readCaveat = psql.
+			Select(colCaveatDefinition, colCreatedXid).
+			From(tableCaveat)
 	deleteCaveat = psql.Update(tableCaveat).Where(sq.Eq{colDeletedXid: liveDeletedTxnID})
 )
 
@@ -27,21 +34,17 @@ const (
 )
 
 func (r *pgReader) ReadCaveatByName(ctx context.Context, name string) (*core.CaveatDefinition, datastore.Revision, error) {
-	filteredReadCaveat := r.filterer(readCaveat)
+	filteredReadCaveat := r.aliveFilter(readCaveat)
 	sql, args, err := filteredReadCaveat.Where(sq.Eq{colCaveatName: name}).ToSql()
 	if err != nil {
 		return nil, datastore.NoRevision, fmt.Errorf(errReadCaveat, err)
 	}
 
-	tx, txCleanup, err := r.txSource(ctx)
-	if err != nil {
-		return nil, datastore.NoRevision, fmt.Errorf(errReadCaveat, err)
-	}
-	defer txCleanup(ctx)
-
 	var txID xid8
 	var serializedDef []byte
-	err = tx.QueryRow(ctx, sql, args...).Scan(&serializedDef, &txID)
+	err = r.query.QueryRowFunc(ctx, func(ctx context.Context, row pgx.Row) error {
+		return row.Scan(&serializedDef, &txID)
+	}, sql, args...)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, datastore.NoRevision, datastore.NewCaveatNameNotFoundErr(name)
@@ -53,51 +56,57 @@ func (r *pgReader) ReadCaveatByName(ctx context.Context, name string) (*core.Cav
 	if err != nil {
 		return nil, datastore.NoRevision, fmt.Errorf(errReadCaveat, err)
 	}
-	rev := postgresRevision{txID, noXmin}
+
+	rev := revisionForVersion(txID)
 
 	return &def, rev, nil
 }
 
-func (r *pgReader) ListCaveats(ctx context.Context, caveatNames ...string) ([]*core.CaveatDefinition, error) {
+func (r *pgReader) LookupCaveatsWithNames(ctx context.Context, caveatNames []string) ([]datastore.RevisionedCaveat, error) {
+	if len(caveatNames) == 0 {
+		return nil, nil
+	}
+	return r.lookupCaveats(ctx, caveatNames)
+}
+
+func (r *pgReader) ListAllCaveats(ctx context.Context) ([]datastore.RevisionedCaveat, error) {
+	return r.lookupCaveats(ctx, nil)
+}
+
+func (r *pgReader) lookupCaveats(ctx context.Context, caveatNames []string) ([]datastore.RevisionedCaveat, error) {
 	caveatsWithNames := listCaveat
 	if len(caveatNames) > 0 {
 		caveatsWithNames = caveatsWithNames.Where(sq.Eq{colCaveatName: caveatNames})
 	}
 
-	filteredListCaveat := r.filterer(caveatsWithNames)
+	filteredListCaveat := r.aliveFilter(caveatsWithNames)
 	sql, args, err := filteredListCaveat.ToSql()
 	if err != nil {
 		return nil, fmt.Errorf(errListCaveats, err)
 	}
 
-	tx, txCleanup, err := r.txSource(ctx)
+	var caveats []datastore.RevisionedCaveat
+	err = r.query.QueryFunc(ctx, func(ctx context.Context, rows pgx.Rows) error {
+		for rows.Next() {
+			var version xid8
+			var defBytes []byte
+			err = rows.Scan(&defBytes, &version)
+			if err != nil {
+				return fmt.Errorf(errListCaveats, err)
+			}
+			c := core.CaveatDefinition{}
+			err = c.UnmarshalVT(defBytes)
+			if err != nil {
+				return fmt.Errorf(errListCaveats, err)
+			}
+
+			revision := revisionForVersion(version)
+			caveats = append(caveats, datastore.RevisionedCaveat{Definition: &c, LastWrittenRevision: revision})
+		}
+		return rows.Err()
+	}, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf(errListCaveats, err)
-	}
-	defer txCleanup(ctx)
-
-	rows, err := tx.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, fmt.Errorf(errListCaveats, err)
-	}
-
-	defer rows.Close()
-	var caveats []*core.CaveatDefinition
-	for rows.Next() {
-		var defBytes []byte
-		err = rows.Scan(&defBytes)
-		if err != nil {
-			return nil, fmt.Errorf(errListCaveats, err)
-		}
-		c := core.CaveatDefinition{}
-		err = c.UnmarshalVT(defBytes)
-		if err != nil {
-			return nil, fmt.Errorf(errListCaveats, err)
-		}
-		caveats = append(caveats, &c)
-	}
-	if rows.Err() != nil {
-		return nil, fmt.Errorf(errListCaveats, rows.Err())
 	}
 
 	return caveats, nil
@@ -108,7 +117,7 @@ func (rwt *pgReadWriteTXN) WriteCaveats(ctx context.Context, caveats []*core.Cav
 		return nil
 	}
 	write := writeCaveat
-	writtenCaveatNames := make([]string, 0, len(caveats))
+	writtenCaveatNames := mapz.NewSet[string]()
 	for _, caveat := range caveats {
 		definitionBytes, err := caveat.MarshalVT()
 		if err != nil {
@@ -116,11 +125,13 @@ func (rwt *pgReadWriteTXN) WriteCaveats(ctx context.Context, caveats []*core.Cav
 		}
 		valuesToWrite := []any{caveat.Name, definitionBytes}
 		write = write.Values(valuesToWrite...)
-		writtenCaveatNames = append(writtenCaveatNames, caveat.Name)
+		if !writtenCaveatNames.Add(caveat.Name) {
+			return fmt.Errorf("duplicate caveat name %q", caveat.Name)
+		}
 	}
 
 	// mark current caveats as deleted
-	err := rwt.deleteCaveatsFromNames(ctx, writtenCaveatNames)
+	err := rwt.deleteCaveatsFromNames(ctx, writtenCaveatNames.AsSlice())
 	if err != nil {
 		return fmt.Errorf(errWriteCaveats, err)
 	}

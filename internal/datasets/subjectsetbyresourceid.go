@@ -3,8 +3,8 @@ package datasets
 import (
 	"fmt"
 
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 // NewSubjectSetByResourceID creates and returns a map of subject sets, indexed by resource ID.
@@ -29,16 +29,15 @@ func (ssr SubjectSetByResourceID) add(resourceID string, subject *v1.FoundSubjec
 	if !ok {
 		ssr.subjectSetByResourceID[resourceID] = NewSubjectSet()
 	}
-	ssr.subjectSetByResourceID[resourceID].Add(subject)
-	return nil
+	return ssr.subjectSetByResourceID[resourceID].Add(subject)
 }
 
 // AddFromRelationship adds the subject found in the given relationship to this map, indexed at
 // the resource ID specified in the relationship.
-func (ssr SubjectSetByResourceID) AddFromRelationship(relationship *core.RelationTuple) error {
-	return ssr.add(relationship.ResourceAndRelation.ObjectId, &v1.FoundSubject{
-		SubjectId:        relationship.Subject.ObjectId,
-		CaveatExpression: wrapCaveat(relationship.Caveat),
+func (ssr SubjectSetByResourceID) AddFromRelationship(relationship tuple.Relationship) error {
+	return ssr.add(relationship.Resource.ObjectID, &v1.FoundSubject{
+		SubjectId:        relationship.Subject.ObjectID,
+		CaveatExpression: wrapCaveat(relationship.OptionalCaveat),
 	})
 }
 
@@ -60,14 +59,18 @@ func (ssr SubjectSetByResourceID) UnionWith(other map[string]*v1.FoundSubjects) 
 }
 
 // IntersectionDifference performs an in-place intersection between the two maps' sets.
-func (ssr SubjectSetByResourceID) IntersectionDifference(other SubjectSetByResourceID) {
+func (ssr SubjectSetByResourceID) IntersectionDifference(other SubjectSetByResourceID) error {
 	for otherResourceID, otherSubjectSet := range other.subjectSetByResourceID {
 		existing, ok := ssr.subjectSetByResourceID[otherResourceID]
 		if !ok {
 			continue
 		}
 
-		existing.IntersectionDifference(otherSubjectSet)
+		err := existing.IntersectionDifference(otherSubjectSet)
+		if err != nil {
+			return err
+		}
+
 		if existing.IsEmpty() {
 			delete(ssr.subjectSetByResourceID, otherResourceID)
 		}
@@ -80,6 +83,8 @@ func (ssr SubjectSetByResourceID) IntersectionDifference(other SubjectSetByResou
 			continue
 		}
 	}
+
+	return nil
 }
 
 // SubtractAll subtracts all sets in the other map from this map's sets.

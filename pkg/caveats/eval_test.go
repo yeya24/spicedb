@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/cel-go/cel"
+	"github.com/authzed/cel-go/cel"
 	"github.com/stretchr/testify/require"
 
 	"github.com/authzed/spicedb/pkg/caveats/types"
@@ -107,7 +107,7 @@ func TestEvaluateCaveat(t *testing.T) {
 			"",
 			true,
 			"",
-			[]string{"b"},
+			noMissingVars,
 		},
 		{
 			"missing variables for left side of boolean expression",
@@ -122,7 +122,7 @@ func TestEvaluateCaveat(t *testing.T) {
 			"",
 			true,
 			"",
-			[]string{"a"},
+			noMissingVars,
 		},
 		{
 			"missing variables for both sides of boolean expression",
@@ -135,7 +135,7 @@ func TestEvaluateCaveat(t *testing.T) {
 			"",
 			false,
 			"a == 2 || b == 6",
-			[]string{"a"}, // second part of OR expression is not evaluated
+			[]string{"a", "b"},
 		},
 		{
 			"missing variable for left side of and boolean expression",
@@ -149,7 +149,7 @@ func TestEvaluateCaveat(t *testing.T) {
 			},
 			"",
 			false,
-			"a == 2 && true",
+			"a == 2",
 			[]string{"a"},
 		},
 		{
@@ -164,13 +164,13 @@ func TestEvaluateCaveat(t *testing.T) {
 			},
 			"",
 			false,
-			"true && b == 6",
+			"b == 6",
 			[]string{"b"},
 		},
 		{
 			"map evaluation",
 			MustEnvForVariables(map[string]types.VariableType{
-				"m":   types.MapType(types.BooleanType),
+				"m":   types.MustMapType(types.BooleanType),
 				"idx": types.StringType,
 			}),
 			"m[idx]",
@@ -188,7 +188,7 @@ func TestEvaluateCaveat(t *testing.T) {
 		{
 			"map dot evaluation",
 			MustEnvForVariables(map[string]types.VariableType{
-				"m": types.MapType(types.BooleanType),
+				"m": types.MustMapType(types.BooleanType),
 			}),
 			"m.foo",
 			map[string]any{
@@ -202,9 +202,36 @@ func TestEvaluateCaveat(t *testing.T) {
 			noMissingVars,
 		},
 		{
+			"missing map for evaluation",
+			MustEnvForVariables(map[string]types.VariableType{
+				"m":   types.MustMapType(types.BooleanType),
+				"idx": types.StringType,
+			}),
+			"m[idx]",
+			map[string]any{
+				"idx": "1",
+			},
+			"",
+			false,
+			"m[idx]",
+			[]string{"m"},
+		},
+		{
+			"missing map for attribute evaluation",
+			MustEnvForVariables(map[string]types.VariableType{
+				"m": types.MustMapType(types.BooleanType),
+			}),
+			"m.first",
+			map[string]any{},
+			"",
+			false,
+			"m.first",
+			[]string{"m"},
+		},
+		{
 			"nested evaluation",
 			MustEnvForVariables(map[string]types.VariableType{
-				"metadata.l":   types.ListType(types.StringType),
+				"metadata.l":   types.MustListType(types.StringType),
 				"metadata.idx": types.IntType,
 			}),
 			"metadata.l[metadata.idx] == 'hello'",
@@ -220,7 +247,7 @@ func TestEvaluateCaveat(t *testing.T) {
 		{
 			"nested evaluation with missing value",
 			MustEnvForVariables(map[string]types.VariableType{
-				"metadata.l":   types.ListType(types.StringType),
+				"metadata.l":   types.MustListType(types.StringType),
 				"metadata.idx": types.IntType,
 			}),
 			"metadata.l[metadata.idx] == 'hello'",
@@ -235,7 +262,7 @@ func TestEvaluateCaveat(t *testing.T) {
 		{
 			"nested evaluation with missing list",
 			MustEnvForVariables(map[string]types.VariableType{
-				"metadata.l":   types.ListType(types.StringType),
+				"metadata.l":   types.MustListType(types.StringType),
 				"metadata.idx": types.IntType,
 			}),
 			"metadata.l[metadata.idx] == 'hello'",
@@ -261,9 +288,74 @@ func TestEvaluateCaveat(t *testing.T) {
 			"",
 			noMissingVars,
 		},
+		{
+			"timestamp comparison",
+			MustEnvForVariables(map[string]types.VariableType{
+				"a": types.TimestampType,
+				"b": types.TimestampType,
+			}),
+			"a < b",
+			map[string]any{
+				"a": time.Date(2000, 10, 10, 10, 10, 10, 10, wetTz),
+				"b": time.Date(2000, 10, 10, 10, 10, 10, 10, wetTz),
+			},
+			"",
+			false,
+			"",
+			noMissingVars,
+		},
+		{
+			"timestamp comparison 2",
+			MustEnvForVariables(map[string]types.VariableType{
+				"a": types.TimestampType,
+				"b": types.TimestampType,
+			}),
+			"a <= b",
+			map[string]any{
+				"a": time.Date(2000, 10, 10, 10, 10, 10, 10, wetTz),
+				"b": time.Date(2000, 10, 10, 10, 10, 10, 10, wetTz),
+			},
+			"",
+			true,
+			"",
+			noMissingVars,
+		},
+		{
+			"optional types not found",
+			MustEnvForVariables(map[string]types.VariableType{
+				"m":   types.MustMapType(types.BooleanType),
+				"key": types.StringType,
+			}),
+			"m[?key].orValue(true)",
+			map[string]any{
+				"m":   map[string]bool{"foo": true, "bar": false},
+				"key": "baz",
+			},
+			"",
+			true,
+			"",
+			noMissingVars,
+		},
+		{
+			"optional types found",
+			MustEnvForVariables(map[string]types.VariableType{
+				"m":   types.MustMapType(types.BooleanType),
+				"key": types.StringType,
+			}),
+			"m[?key].orValue(true)",
+			map[string]any{
+				"m":   map[string]bool{"foo": true, "bar": false},
+				"key": "bar",
+			},
+			"",
+			false,
+			"",
+			noMissingVars,
+		},
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			compiled, err := compileCaveat(tc.env, tc.exprString)
 			require.NoError(t, err)
@@ -296,6 +388,8 @@ func TestEvaluateCaveat(t *testing.T) {
 					require.False(t, result.IsPartial())
 					_, partialErr := result.PartialValue()
 					require.Error(t, partialErr)
+					require.Nil(t, tc.missingVars)
+					require.Nil(t, result.missingVarNames)
 				}
 			}
 		})

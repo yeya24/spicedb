@@ -1,28 +1,28 @@
 package memdb
 
 import (
-	"fmt"
+	"time"
 
-	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/hashicorp/go-memdb"
-	"github.com/jzelinskie/stringz"
 	"github.com/rs/zerolog"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/authzed/spicedb/pkg/datastore"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 const (
 	tableNamespace = "namespace"
 
-	tableRelationship           = "relationship"
-	indexID                     = "id"
-	indexNamespace              = "namespace"
-	indexNamespaceAndResourceID = "namespaceAndResourceID"
-	indexNamespaceAndRelation   = "namespaceAndRelation"
-	indexNamespaceAndSubjectID  = "namespaceAndSubjectID"
-	indexSubjectNamespace       = "subjectNamespace"
+	tableRelationship         = "relationship"
+	indexID                   = "id"
+	indexNamespace            = "namespace"
+	indexNamespaceAndRelation = "namespaceAndRelation"
+	indexSubjectNamespace     = "subjectNamespace"
+
+	tableCounters = "counters"
 
 	tableChangelog = "changelog"
 	indexRevision  = "id"
@@ -38,6 +38,13 @@ func (ns namespace) MarshalZerologObject(e *zerolog.Event) {
 	e.Stringer("rev", ns.updated).Str("name", ns.name)
 }
 
+type counter struct {
+	name        string
+	filterBytes []byte
+	count       int
+	updated     datastore.Revision
+}
+
 type relationship struct {
 	namespace        string
 	resourceID       string
@@ -46,6 +53,26 @@ type relationship struct {
 	subjectObjectID  string
 	subjectRelation  string
 	caveat           *contextualizedCaveat
+	integrity        *relationshipIntegrity
+	expiration       *time.Time
+}
+
+type relationshipIntegrity struct {
+	keyID     string
+	hash      []byte
+	timestamp time.Time
+}
+
+func (ri relationshipIntegrity) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("keyID", ri.keyID).Bytes("hash", ri.hash).Time("timestamp", ri.timestamp)
+}
+
+func (ri relationshipIntegrity) RelationshipIntegrity() *core.RelationshipIntegrity {
+	return &core.RelationshipIntegrity{
+		KeyId:    ri.keyID,
+		Hash:     ri.hash,
+		HashedAt: timestamppb.New(ri.timestamp),
+	}
 }
 
 type contextualizedCaveat struct {
@@ -70,59 +97,48 @@ func (cr *contextualizedCaveat) ContextualizedCaveat() (*core.ContextualizedCave
 func (r relationship) String() string {
 	caveat := ""
 	if r.caveat != nil {
-		caveat = fmt.Sprintf("[%s]", r.caveat.caveatName)
+		caveat = "[" + r.caveat.caveatName + "]"
 	}
 
-	return fmt.Sprintf(
-		"%s:%s#%s@%s:%s#%s%s",
-		r.namespace,
-		r.resourceID,
-		r.relation,
-		r.subjectNamespace,
-		r.subjectObjectID,
-		r.subjectRelation,
-		caveat,
-	)
+	expiration := ""
+	if r.expiration != nil {
+		expiration = "[expiration:" + r.expiration.Format(time.RFC3339Nano) + "]"
+	}
+
+	return r.namespace + ":" + r.resourceID + "#" + r.relation + "@" + r.subjectNamespace + ":" + r.subjectObjectID + "#" + r.subjectRelation + caveat + expiration
 }
 
 func (r relationship) MarshalZerologObject(e *zerolog.Event) {
 	e.Str("rel", r.String())
 }
 
-func (r relationship) Relationship() *v1.Relationship {
-	return &v1.Relationship{
-		Resource: &v1.ObjectReference{
-			ObjectType: r.namespace,
-			ObjectId:   r.resourceID,
-		},
-		Relation: r.relation,
-		Subject: &v1.SubjectReference{
-			Object: &v1.ObjectReference{
-				ObjectType: r.subjectNamespace,
-				ObjectId:   r.subjectObjectID,
-			},
-			OptionalRelation: stringz.Default(r.subjectRelation, "", datastore.Ellipsis),
-		},
-	}
-}
-
-func (r relationship) RelationTuple() (*core.RelationTuple, error) {
+func (r relationship) Relationship() (tuple.Relationship, error) {
 	cr, err := r.caveat.ContextualizedCaveat()
 	if err != nil {
-		return nil, err
+		return tuple.Relationship{}, err
 	}
-	return &core.RelationTuple{
-		ResourceAndRelation: &core.ObjectAndRelation{
-			Namespace: r.namespace,
-			ObjectId:  r.resourceID,
-			Relation:  r.relation,
+
+	var ig *core.RelationshipIntegrity
+	if r.integrity != nil {
+		ig = r.integrity.RelationshipIntegrity()
+	}
+
+	return tuple.Relationship{
+		RelationshipReference: tuple.RelationshipReference{
+			Resource: tuple.ObjectAndRelation{
+				ObjectType: r.namespace,
+				ObjectID:   r.resourceID,
+				Relation:   r.relation,
+			},
+			Subject: tuple.ObjectAndRelation{
+				ObjectType: r.subjectNamespace,
+				ObjectID:   r.subjectObjectID,
+				Relation:   r.subjectRelation,
+			},
 		},
-		Subject: &core.ObjectAndRelation{
-			Namespace: r.subjectNamespace,
-			ObjectId:  r.subjectObjectID,
-			Relation:  r.subjectRelation,
-		},
-		Caveat: cr,
+		OptionalCaveat:     cr,
+		OptionalIntegrity:  ig,
+		OptionalExpiration: r.expiration,
 	}, nil
 }
 
@@ -175,16 +191,6 @@ var schema = &memdb.DBSchema{
 					Unique:  false,
 					Indexer: &memdb.StringFieldIndex{Field: "namespace"},
 				},
-				indexNamespaceAndResourceID: {
-					Name:   indexNamespaceAndResourceID,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "resourceID"},
-						},
-					},
-				},
 				indexNamespaceAndRelation: {
 					Name:   indexNamespaceAndRelation,
 					Unique: false,
@@ -192,17 +198,6 @@ var schema = &memdb.DBSchema{
 						Indexes: []memdb.Indexer{
 							&memdb.StringFieldIndex{Field: "namespace"},
 							&memdb.StringFieldIndex{Field: "relation"},
-						},
-					},
-				},
-				indexNamespaceAndSubjectID: {
-					Name:   indexNamespaceAndSubjectID,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-							&memdb.StringFieldIndex{Field: "subjectObjectID"},
 						},
 					},
 				},
@@ -215,6 +210,16 @@ var schema = &memdb.DBSchema{
 		},
 		tableCaveats: {
 			Name: tableCaveats,
+			Indexes: map[string]*memdb.IndexSchema{
+				indexID: {
+					Name:    indexID,
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "name"},
+				},
+			},
+		},
+		tableCounters: {
+			Name: tableCounters,
 			Indexes: map[string]*memdb.IndexSchema{
 				indexID: {
 					Name:    indexID,

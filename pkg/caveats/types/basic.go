@@ -6,7 +6,9 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/google/cel-go/cel"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
+
+	"github.com/authzed/cel-go/cel"
 )
 
 func requireType[T any](value any) (any, error) {
@@ -66,12 +68,12 @@ func convertNumericType[T int64 | uint64 | float64](value any) (any, error) {
 		return numericValue, nil
 
 	default:
-		panic("unsupported numeric type")
+		return nil, spiceerrors.MustBugf("unsupported numeric type in caveat number type conversion: %T", n)
 	}
 }
 
 var (
-	AnyType     = registerBasicType("any", cel.AnyType, func(value any) (any, error) { return value, nil })
+	AnyType     = registerBasicType("any", cel.DynType, func(value any) (any, error) { return value, nil })
 	BooleanType = registerBasicType("bool", cel.BoolType, requireType[bool])
 	StringType  = registerBasicType("string", cel.StringType, requireType[string])
 	IntType     = registerBasicType("int", cel.IntType, convertNumericType[int64])
@@ -174,3 +176,19 @@ var (
 		},
 	)
 )
+
+func MustListType(childTypes ...VariableType) VariableType {
+	t, err := ListType(childTypes...)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func MustMapType(childTypes ...VariableType) VariableType {
+	t, err := MapType(childTypes...)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}

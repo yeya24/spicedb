@@ -66,6 +66,19 @@ var lexerTests = []lexerTest{
 		tEOF,
 	}},
 
+	{"multiple slash path", "foo/bar/baz/bang/zoom", []Lexeme{
+		{TokenTypeIdentifier, 0, "foo", ""},
+		{TokenTypeDiv, 0, "/", ""},
+		{TokenTypeIdentifier, 0, "bar", ""},
+		{TokenTypeDiv, 0, "/", ""},
+		{TokenTypeIdentifier, 0, "baz", ""},
+		{TokenTypeDiv, 0, "/", ""},
+		{TokenTypeIdentifier, 0, "bang", ""},
+		{TokenTypeDiv, 0, "/", ""},
+		{TokenTypeIdentifier, 0, "zoom", ""},
+		tEOF,
+	}},
+
 	{"type star", "foo:*", []Lexeme{
 		{TokenTypeIdentifier, 0, "foo", ""},
 		{TokenTypeColon, 0, ":", ""},
@@ -234,10 +247,21 @@ var lexerTests = []lexerTest{
 			},
 		},
 	},
+
+	{"dot access", "foo.all(something)", []Lexeme{
+		{TokenTypeIdentifier, 0, "foo", ""},
+		{TokenTypePeriod, 0, ".", ""},
+		{TokenTypeIdentifier, 0, "all", ""},
+		{TokenTypeLeftParen, 0, "(", ""},
+		{TokenTypeIdentifier, 0, "something", ""},
+		{TokenTypeRightParen, 0, ")", ""},
+		tEOF,
+	}},
 }
 
 func TestLexer(t *testing.T) {
 	for _, test := range lexerTests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			test := test // Close over test and not the pointer that is reused.
 			tokens := performLex(&test)

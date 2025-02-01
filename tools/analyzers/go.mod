@@ -1,13 +1,14 @@
 module github.com/authzed/spicedb/tools/analyzers
 
-go 1.19
+go 1.23.1
 
 require (
-	github.com/jzelinskie/stringz v0.0.1
-	golang.org/x/tools v0.1.12
+	github.com/samber/lo v1.47.0
+	golang.org/x/tools v0.21.1-0.20240508182429-e35e4ccd0d2d
 )
 
 require (
-	golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4 // indirect
-	golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f // indirect
+	golang.org/x/mod v0.17.0 // indirect
+	golang.org/x/sync v0.7.0 // indirect
+	golang.org/x/text v0.16.0 // indirect
 )

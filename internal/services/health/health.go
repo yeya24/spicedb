@@ -10,6 +10,7 @@ import (
 
 	"github.com/authzed/spicedb/internal/dispatch"
 	log "github.com/authzed/spicedb/internal/logging"
+	"github.com/authzed/spicedb/pkg/datastore"
 )
 
 const datastoreReadyTimeout = time.Millisecond * 500
@@ -25,8 +26,8 @@ func NewHealthManager(dispatcher dispatch.Dispatcher, dsc DatastoreChecker) Mana
 // DatastoreChecker is an interface for determining if the datastore is ready for
 // traffic.
 type DatastoreChecker interface {
-	// IsReady returns whether the datastore is ready to be used.
-	IsReady(ctx context.Context) (bool, error)
+	// ReadyState returns whether the datastore is ready to be used.
+	ReadyState(ctx context.Context) (datastore.ReadyState, error)
 }
 
 // Manager is a system which manages the health service statuses.
@@ -62,18 +63,20 @@ func (hm *healthManager) Checker(ctx context.Context) func() error {
 	return func() error {
 		// Run immediately for the initial check
 		backoffInterval := backoff.NewExponentialBackOff()
+		backoffInterval.MaxElapsedTime = 0
+
 		ticker := time.After(0)
 
 		for {
 			select {
 			case _, ok := <-ticker:
 				if !ok {
-					log.Warn().Msg("backoff error while waiting for dispatcher or datastore health")
+					log.Ctx(ctx).Warn().Msg("backoff error while waiting for dispatcher or datastore health")
 					return nil
 				}
 
 			case <-ctx.Done():
-				log.Warn().Msg("datastore health context was canceled")
+				log.Ctx(ctx).Info().Msg("datastore health check canceled")
 				return nil
 			}
 
@@ -87,7 +90,7 @@ func (hm *healthManager) Checker(ctx context.Context) func() error {
 
 			nextPush := backoffInterval.NextBackOff()
 			if nextPush == backoff.Stop {
-				log.Warn().Msg("exceed max attempts to check for dispatch or datastore ready")
+				log.Ctx(ctx).Warn().Msg("exceed max attempts to check for dispatch or datastore ready")
 				return nil
 			}
 			ticker = time.After(nextPush)
@@ -96,17 +99,27 @@ func (hm *healthManager) Checker(ctx context.Context) func() error {
 }
 
 func (hm *healthManager) checkIsReady(ctx context.Context) bool {
-	log.Debug().Msg("checking if datastore and dispatcher are ready")
+	log.Ctx(ctx).Debug().Msg("checking if datastore and dispatcher are ready")
 
 	ctx, cancel := context.WithTimeout(ctx, datastoreReadyTimeout)
 	defer cancel()
 
-	dsReady, err := hm.dsc.IsReady(ctx)
+	dsReady, err := hm.dsc.ReadyState(ctx)
 	if err != nil {
-		log.Warn().Err(err).Msg("could not check if the datastore was ready")
+		log.Ctx(ctx).Warn().Err(err).Msg("could not check if the datastore was ready")
 	}
 
-	dispatchReady := hm.dispatcher.IsReady()
-	log.Debug().Bool("datastoreReady", dsReady).Bool("dispatchReady", dispatchReady).Msg("completed dispatcher and datastore readiness checks")
-	return dsReady && dispatchReady
+	if !dsReady.IsReady {
+		log.Ctx(ctx).Warn().Bool("datastoreReady", false).Msgf("datastore failed readiness checks: %s", dsReady.Message)
+		return false
+	}
+
+	dispatchReady := hm.dispatcher.ReadyState()
+	if !dispatchReady.IsReady {
+		log.Ctx(ctx).Warn().Bool("dispatchReady", false).Msgf("dispatcher failed readiness checks: %s", dispatchReady.Message)
+		return false
+	}
+
+	log.Ctx(ctx).Debug().Bool("datastoreReady", true).Bool("dispatchReady", true).Msg("completed dispatcher and datastore readiness checks")
+	return true
 }

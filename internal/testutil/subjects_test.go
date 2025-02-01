@@ -11,16 +11,19 @@ import (
 )
 
 var (
-	caveatexpr = caveats.CaveatExprForTesting
-	caveatAnd  = caveats.And
-	caveatOr   = caveats.Or
-	sub        = FoundSubject
-	wc         = Wildcard
-	csub       = CaveatedFoundSubject
-	cwc        = CaveatedWildcard
+	caveatexpr   = caveats.CaveatExprForTesting
+	caveatAnd    = caveats.And
+	caveatOr     = caveats.Or
+	caveatInvert = caveats.Invert
+	sub          = FoundSubject
+	wc           = Wildcard
+	csub         = CaveatedFoundSubject
+	cwc          = CaveatedWildcard
 )
 
 func TestCompareSubjects(t *testing.T) {
+	t.Parallel()
+
 	tcs := []struct {
 		first              *v1.FoundSubject
 		second             *v1.FoundSubject
@@ -54,6 +57,21 @@ func TestCompareSubjects(t *testing.T) {
 		{
 			sub("1"),
 			sub("2"),
+			false,
+		},
+		{
+			csub("1", caveatexpr("first")),
+			csub("1", caveatInvert(caveatexpr("first"))),
+			false,
+		},
+		{
+			csub("1", caveatInvert(caveatexpr("first"))),
+			csub("1", caveatInvert(caveatexpr("first"))),
+			true,
+		},
+		{
+			csub("1", caveatInvert(caveatexpr("first"))),
+			csub("1", caveatInvert(caveatexpr("second"))),
 			false,
 		},
 		{
@@ -131,6 +149,7 @@ func TestCompareSubjects(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(fmt.Sprintf("%s vs %s", FormatSubject(tc.first), FormatSubject(tc.second)), func(t *testing.T) {
 			err := CheckEquivalentSubjects(tc.first, tc.second)
 			if tc.expectedEquivalent {

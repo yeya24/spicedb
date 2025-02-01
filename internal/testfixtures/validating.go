@@ -7,11 +7,11 @@ import (
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 
-	"github.com/authzed/spicedb/internal/datastore/options"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/tuple"
-	"github.com/authzed/spicedb/pkg/util"
 )
 
 type validatingDatastore struct {
@@ -31,31 +31,36 @@ func (vd validatingDatastore) SnapshotReader(revision datastore.Revision) datast
 func (vd validatingDatastore) ReadWriteTx(
 	ctx context.Context,
 	f datastore.TxUserFunc,
+	opts ...options.RWTOptionsOption,
 ) (datastore.Revision, error) {
 	if f == nil {
 		return datastore.NoRevision, fmt.Errorf("nil delegate function")
 	}
 
-	return vd.Datastore.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	return vd.Datastore.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		txDelegate := validatingReadWriteTransaction{validatingSnapshotReader{rwt}, rwt}
-		return f(txDelegate)
-	})
+		return f(ctx, txDelegate)
+	}, opts...)
+}
+
+func (vd validatingDatastore) Unwrap() datastore.Datastore {
+	return vd.Datastore
 }
 
 type validatingSnapshotReader struct {
 	delegate datastore.Reader
 }
 
-func (vsr validatingSnapshotReader) ListNamespaces(
+func (vsr validatingSnapshotReader) ListAllNamespaces(
 	ctx context.Context,
-) ([]*core.NamespaceDefinition, error) {
-	read, err := vsr.delegate.ListNamespaces(ctx)
+) ([]datastore.RevisionedNamespace, error) {
+	read, err := vsr.delegate.ListAllNamespaces(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, nsDef := range read {
-		err := nsDef.Validate()
+	for _, ns := range read {
+		err := ns.Definition.Validate()
 		if err != nil {
 			return nil, err
 		}
@@ -64,44 +69,45 @@ func (vsr validatingSnapshotReader) ListNamespaces(
 	return read, err
 }
 
-func (vsr validatingSnapshotReader) LookupNamespaces(
+func (vsr validatingSnapshotReader) LookupNamespacesWithNames(
 	ctx context.Context,
 	nsNames []string,
-) ([]*core.NamespaceDefinition, error) {
-	read, err := vsr.delegate.LookupNamespaces(ctx, nsNames)
+) ([]datastore.RevisionedNamespace, error) {
+	read, err := vsr.delegate.LookupNamespacesWithNames(ctx, nsNames)
 	if err != nil {
 		return read, err
 	}
 
-	for _, nsDef := range read {
-		err := nsDef.Validate()
+	for _, ns := range read {
+		err := ns.Definition.Validate()
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return read, err
+	return read, nil
+}
+
+func (vsr validatingSnapshotReader) CountRelationships(ctx context.Context, name string) (int, error) {
+	return vsr.delegate.CountRelationships(ctx, name)
+}
+
+func (vsr validatingSnapshotReader) LookupCounters(ctx context.Context) ([]datastore.RelationshipCounter, error) {
+	return vsr.delegate.LookupCounters(ctx)
 }
 
 func (vsr validatingSnapshotReader) QueryRelationships(ctx context.Context,
 	filter datastore.RelationshipsFilter,
 	opts ...options.QueryOptionsOption,
 ) (datastore.RelationshipIterator, error) {
-	queryOpts := options.NewQueryOptionsWithOptions(opts...)
-	for _, sub := range queryOpts.Usersets {
-		if err := sub.Validate(); err != nil {
-			return nil, err
-		}
-	}
-
 	return vsr.delegate.QueryRelationships(ctx, filter, opts...)
 }
 
-func (vsr validatingSnapshotReader) ReadNamespace(
+func (vsr validatingSnapshotReader) ReadNamespaceByName(
 	ctx context.Context,
 	nsName string,
 ) (*core.NamespaceDefinition, datastore.Revision, error) {
-	read, createdAt, err := vsr.delegate.ReadNamespace(ctx, nsName)
+	read, createdAt, err := vsr.delegate.ReadNamespaceByName(ctx, nsName)
 	if err != nil {
 		return read, createdAt, err
 	}
@@ -137,14 +143,30 @@ func (vsr validatingSnapshotReader) ReadCaveatByName(ctx context.Context, name s
 	return read, createdAt, err
 }
 
-func (vsr validatingSnapshotReader) ListCaveats(ctx context.Context, caveatNames ...string) ([]*core.CaveatDefinition, error) {
-	read, err := vsr.delegate.ListCaveats(ctx, caveatNames...)
+func (vsr validatingSnapshotReader) LookupCaveatsWithNames(ctx context.Context, caveatNames []string) ([]datastore.RevisionedCaveat, error) {
+	read, err := vsr.delegate.LookupCaveatsWithNames(ctx, caveatNames)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, caveatDef := range read {
-		err := caveatDef.Validate()
+	for _, caveat := range read {
+		err := caveat.Definition.Validate()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return read, err
+}
+
+func (vsr validatingSnapshotReader) ListAllCaveats(ctx context.Context) ([]datastore.RevisionedCaveat, error) {
+	read, err := vsr.delegate.ListAllCaveats(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, caveat := range read {
+		err := caveat.Definition.Validate()
 		if err != nil {
 			return nil, err
 		}
@@ -156,6 +178,22 @@ func (vsr validatingSnapshotReader) ListCaveats(ctx context.Context, caveatNames
 type validatingReadWriteTransaction struct {
 	validatingSnapshotReader
 	delegate datastore.ReadWriteTransaction
+}
+
+func (vrwt validatingReadWriteTransaction) RegisterCounter(ctx context.Context, name string, filter *core.RelationshipFilter) error {
+	if err := filter.Validate(); err != nil {
+		return err
+	}
+
+	return vrwt.delegate.RegisterCounter(ctx, name, filter)
+}
+
+func (vrwt validatingReadWriteTransaction) UnregisterCounter(ctx context.Context, name string) error {
+	return vrwt.delegate.UnregisterCounter(ctx, name)
+}
+
+func (vrwt validatingReadWriteTransaction) StoreCounterValue(ctx context.Context, name string, value int, computedAtRevision datastore.Revision) error {
+	return vrwt.delegate.StoreCounterValue(ctx, name, value, computedAtRevision)
 }
 
 func (vrwt validatingReadWriteTransaction) WriteNamespaces(ctx context.Context, newConfigs ...*core.NamespaceDefinition) error {
@@ -171,32 +209,28 @@ func (vrwt validatingReadWriteTransaction) DeleteNamespaces(ctx context.Context,
 	return vrwt.delegate.DeleteNamespaces(ctx, nsNames...)
 }
 
-func (vrwt validatingReadWriteTransaction) WriteRelationships(ctx context.Context, mutations []*core.RelationTupleUpdate) error {
+func (vrwt validatingReadWriteTransaction) WriteRelationships(ctx context.Context, mutations []tuple.RelationshipUpdate) error {
 	if err := validateUpdatesToWrite(mutations...); err != nil {
 		return err
 	}
 
 	// Ensure there are no duplicate mutations.
-	tupleSet := util.NewSet[string]()
+	tupleSet := mapz.NewSet[string]()
 	for _, mutation := range mutations {
-		if err := mutation.Validate(); err != nil {
-			return err
-		}
-
-		if !tupleSet.Add(tuple.String(mutation.Tuple)) {
-			return fmt.Errorf("found duplicate update for relationship %s", tuple.String(mutation.Tuple))
+		if !tupleSet.Add(tuple.StringWithoutCaveatOrExpiration(mutation.Relationship)) {
+			return fmt.Errorf("found duplicate update for relationship %s", tuple.StringWithoutCaveatOrExpiration(mutation.Relationship))
 		}
 	}
 
 	return vrwt.delegate.WriteRelationships(ctx, mutations)
 }
 
-func (vrwt validatingReadWriteTransaction) DeleteRelationships(ctx context.Context, filter *v1.RelationshipFilter) error {
+func (vrwt validatingReadWriteTransaction) DeleteRelationships(ctx context.Context, filter *v1.RelationshipFilter, options ...options.DeleteOptionsOption) (bool, error) {
 	if err := filter.Validate(); err != nil {
-		return err
+		return false, err
 	}
 
-	return vrwt.delegate.DeleteRelationships(ctx, filter)
+	return vrwt.delegate.DeleteRelationships(ctx, filter, options...)
 }
 
 func (vrwt validatingReadWriteTransaction) WriteCaveats(ctx context.Context, caveats []*core.CaveatDefinition) error {
@@ -207,21 +241,29 @@ func (vrwt validatingReadWriteTransaction) DeleteCaveats(ctx context.Context, na
 	return vrwt.delegate.DeleteCaveats(ctx, names)
 }
 
+func (vrwt validatingReadWriteTransaction) BulkLoad(ctx context.Context, source datastore.BulkWriteRelationshipSource) (uint64, error) {
+	return vrwt.delegate.BulkLoad(ctx, source)
+}
+
 // validateUpdatesToWrite performs basic validation on relationship updates going into datastores.
-func validateUpdatesToWrite(updates ...*core.RelationTupleUpdate) error {
+func validateUpdatesToWrite(updates ...tuple.RelationshipUpdate) error {
 	for _, update := range updates {
-		err := tuple.UpdateToRelationshipUpdate(update).HandwrittenValidate()
+		up, err := tuple.UpdateToV1RelationshipUpdate(update)
 		if err != nil {
 			return err
 		}
-		if update.Tuple.Subject.Relation == "" {
-			return fmt.Errorf("expected ... instead of an empty relation string relation in %v", update.Tuple)
+
+		if err := up.HandwrittenValidate(); err != nil {
+			return err
 		}
-		if update.Tuple.Subject.ObjectId == tuple.PublicWildcard && update.Tuple.Subject.Relation != tuple.Ellipsis {
+		if update.Relationship.Subject.Relation == "" {
+			return fmt.Errorf("expected ... instead of an empty relation string relation in %v", update.Relationship)
+		}
+		if update.Relationship.Subject.ObjectID == tuple.PublicWildcard && update.Relationship.Subject.Relation != tuple.Ellipsis {
 			return fmt.Errorf(
 				"attempt to write a wildcard relationship (`%s`) with a non-empty relation `%v`. Please report this bug",
-				tuple.String(update.Tuple),
-				update.Tuple.Subject.Relation,
+				tuple.MustString(update.Relationship),
+				update.Relationship.Subject.Relation,
 			)
 		}
 	}

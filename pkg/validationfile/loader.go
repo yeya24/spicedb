@@ -10,8 +10,10 @@ import (
 	"github.com/authzed/spicedb/internal/namespace"
 	"github.com/authzed/spicedb/internal/relationships"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/genutil/slicez"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/tuple"
+	"github.com/authzed/spicedb/pkg/typesystem"
 )
 
 // PopulatedValidationFile contains the fully parsed information from a validation file.
@@ -23,9 +25,13 @@ type PopulatedValidationFile struct {
 	// direct or compiled from schema form.
 	NamespaceDefinitions []*core.NamespaceDefinition
 
-	// Tuples are the relation tuples defined in the validation file, either directly
+	// CaveatDefinitions are the caveats defined in the validation file, in either
+	// direct or compiled from schema form.
+	CaveatDefinitions []*core.CaveatDefinition
+
+	// Relationships are the relationships defined in the validation file, either directly
 	// or in the relationships block.
-	Tuples []*core.RelationTuple
+	Relationships []tuple.Relationship
 
 	// ParsedFiles are the underlying parsed validation files.
 	ParsedFiles []ValidationFile
@@ -54,8 +60,8 @@ func PopulateFromFilesContents(ctx context.Context, ds datastore.Datastore, file
 	var schema string
 	var objectDefs []*core.NamespaceDefinition
 	var caveatDefs []*core.CaveatDefinition
-	var tuples []*core.RelationTuple
-	var updates []*core.RelationTupleUpdate
+	var rels []tuple.Relationship
+	var updates []tuple.RelationshipUpdate
 
 	var revision datastore.Revision
 
@@ -87,21 +93,25 @@ func PopulateFromFilesContents(ctx context.Context, ds datastore.Datastore, file
 				schema += parsed.Schema.Schema + "\n\n"
 			}
 
-			log.Info().Str("filePath", filePath).Int("schemaDefinitionCount", len(parsed.Schema.CompiledSchema.OrderedDefinitions)).Msg("adding schema definitions")
+			log.Ctx(ctx).Info().Str("filePath", filePath).
+				Int("definitionCount", len(defs)).
+				Int("caveatDefinitionCount", len(parsed.Schema.CompiledSchema.CaveatDefinitions)).
+				Int("schemaDefinitionCount", len(parsed.Schema.CompiledSchema.OrderedDefinitions)).
+				Msg("adding schema definitions")
+
 			objectDefs = append(objectDefs, defs...)
 			caveatDefs = append(caveatDefs, parsed.Schema.CompiledSchema.CaveatDefinitions...)
 		}
 
 		// Parse relationships for updates.
 		for _, rel := range parsed.Relationships.Relationships {
-			tpl := tuple.MustFromRelationship(rel)
-			updates = append(updates, tuple.Touch(tpl))
-			tuples = append(tuples, tpl)
+			updates = append(updates, tuple.Touch(rel))
+			rels = append(rels, rel)
 		}
 	}
 
 	// Load the definitions and relationships into the datastore.
-	revision, err := ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	revision, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		// Write the caveat definitions.
 		err := rwt.WriteCaveats(ctx, caveatDefs)
 		if err != nil {
@@ -110,9 +120,10 @@ func PopulateFromFilesContents(ctx context.Context, ds datastore.Datastore, file
 
 		// Validate and write the object definitions.
 		for _, objectDef := range objectDefs {
-			ts, err := namespace.NewNamespaceTypeSystem(objectDef,
-				namespace.ResolverForDatastoreReader(rwt).WithPredefinedElements(namespace.PredefinedElements{
+			ts, err := typesystem.NewNamespaceTypeSystem(objectDef,
+				typesystem.ResolverForDatastoreReader(rwt).WithPredefinedElements(typesystem.PredefinedElements{
 					Namespaces: objectDefs,
+					Caveats:    caveatDefs,
 				}))
 			if err != nil {
 				return err
@@ -134,12 +145,31 @@ func PopulateFromFilesContents(ctx context.Context, ds datastore.Datastore, file
 			}
 		}
 
-		err = relationships.ValidateRelationshipUpdates(ctx, rwt, updates)
+		return err
+	})
+
+	slicez.ForEachChunk(updates, 500, func(chunked []tuple.RelationshipUpdate) {
 		if err != nil {
-			return err
+			return
 		}
 
-		return rwt.WriteRelationships(ctx, updates)
+		chunkedRels := make([]tuple.Relationship, 0, len(chunked))
+		for _, update := range chunked {
+			chunkedRels = append(chunkedRels, update.Relationship)
+		}
+		revision, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+			err = relationships.ValidateRelationshipsForCreateOrTouch(ctx, rwt, chunkedRels...)
+			if err != nil {
+				return err
+			}
+
+			return rwt.WriteRelationships(ctx, chunked)
+		})
 	})
-	return &PopulatedValidationFile{schema, objectDefs, tuples, files}, revision, err
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &PopulatedValidationFile{schema, objectDefs, caveatDefs, rels, files}, revision, err
 }

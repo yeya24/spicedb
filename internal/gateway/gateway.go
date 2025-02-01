@@ -4,6 +4,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -22,6 +23,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+
+	"github.com/authzed/spicedb/internal/grpchelpers"
 )
 
 var histogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -34,17 +37,24 @@ var histogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // NewHandler creates an REST gateway HTTP CloserHandler with the provided upstream
 // configuration.
 func NewHandler(ctx context.Context, upstreamAddr, upstreamTLSCertPath string) (*CloserHandler, error) {
+	if upstreamAddr == "" {
+		return nil, fmt.Errorf("upstreamAddr must not be empty")
+	}
+
 	opts := []grpc.DialOption{
-		grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
-		grpc.WithStreamInterceptor(otelgrpc.StreamClientInterceptor()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	}
 	if upstreamTLSCertPath == "" {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		opts = append(opts, grpcutil.WithCustomCerts(upstreamTLSCertPath, grpcutil.SkipVerifyCA))
+		certsOpt, err := grpcutil.WithCustomCerts(grpcutil.SkipVerifyCA, upstreamTLSCertPath)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, certsOpt)
 	}
 
-	healthConn, err := grpc.DialContext(ctx, upstreamAddr, opts...)
+	healthConn, err := grpchelpers.Dial(ctx, upstreamAddr, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +75,11 @@ func NewHandler(ctx context.Context, upstreamAddr, upstreamTLSCertPath string) (
 		return nil, err
 	}
 
+	experimentalConn, err := registerHandler(ctx, gwMux, upstreamAddr, opts, v1.RegisterExperimentalServiceHandler)
+	if err != nil {
+		return nil, err
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/openapi.json", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, proto.OpenAPISchema)
@@ -72,7 +87,7 @@ func NewHandler(ctx context.Context, upstreamAddr, upstreamTLSCertPath string) (
 	mux.Handle("/", gwMux)
 
 	finalHandler := promhttp.InstrumentHandlerDuration(histogram, otelhttp.NewHandler(mux, "gateway"))
-	return newCloserHandler(finalHandler, schemaConn, permissionsConn, watchConn, healthConn), nil
+	return newCloserHandler(finalHandler, schemaConn, permissionsConn, watchConn, healthConn, experimentalConn), nil
 }
 
 // CloserHandler is a http.Handler and a io.Closer. Meant to keep track of resources to closer
@@ -115,7 +130,7 @@ type HandlerRegisterer func(ctx context.Context, mux *runtime.ServeMux, conn *gr
 func registerHandler(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption,
 	registerer HandlerRegisterer,
 ) (*grpc.ClientConn, error) {
-	conn, err := grpc.Dial(endpoint, opts...)
+	conn, err := grpchelpers.Dial(ctx, endpoint, opts...)
 	if err != nil {
 		return nil, err
 	}

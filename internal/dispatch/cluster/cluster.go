@@ -1,22 +1,33 @@
 package cluster
 
 import (
+	"time"
+
 	"github.com/authzed/spicedb/internal/dispatch"
 	"github.com/authzed/spicedb/internal/dispatch/caching"
 	"github.com/authzed/spicedb/internal/dispatch/graph"
 	"github.com/authzed/spicedb/internal/dispatch/keys"
+	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/cache"
 )
-
-const defaultConcurrencyLimit = 50
 
 // Option is a function-style option for configuring a combined Dispatcher.
 type Option func(*optionState)
 
 type optionState struct {
-	prometheusSubsystem string
-	cache               cache.Cache
-	concurrencyLimit    uint16
+	metricsEnabled        bool
+	prometheusSubsystem   string
+	cache                 cache.Cache[keys.DispatchCacheKey, any]
+	concurrencyLimits     graph.ConcurrencyLimits
+	remoteDispatchTimeout time.Duration
+	dispatchChunkSize     uint16
+}
+
+// MetricsEnabled enables issuing prometheus metrics
+func MetricsEnabled(enabled bool) Option {
+	return func(state *optionState) {
+		state.metricsEnabled = enabled
+	}
 }
 
 // PrometheusSubsystem sets the subsystem name for the prometheus metrics
@@ -27,16 +38,31 @@ func PrometheusSubsystem(name string) Option {
 }
 
 // Cache sets the cache for the remote dispatcher.
-func Cache(c cache.Cache) Option {
+func Cache(c cache.Cache[keys.DispatchCacheKey, any]) Option {
 	return func(state *optionState) {
 		state.cache = c
 	}
 }
 
-// ConcurrencyLimit sets the max number of goroutines per operation
-func ConcurrencyLimit(limit uint16) Option {
+// ConcurrencyLimits sets the max number of goroutines per operation
+func ConcurrencyLimits(limits graph.ConcurrencyLimits) Option {
 	return func(state *optionState) {
-		state.concurrencyLimit = limit
+		state.concurrencyLimits = limits
+	}
+}
+
+// DispatchChunkSize sets the maximum number of items to be dispatched in a single dispatch request
+func DispatchChunkSize(dispatchChunkSize uint16) Option {
+	return func(state *optionState) {
+		state.dispatchChunkSize = dispatchChunkSize
+	}
+}
+
+// RemoteDispatchTimeout sets the maximum timeout for a remote dispatch.
+// Defaults to 60s (as defined in the remote dispatcher).
+func RemoteDispatchTimeout(remoteDispatchTimeout time.Duration) Option {
+	return func(state *optionState) {
+		state.remoteDispatchTimeout = remoteDispatchTimeout
 	}
 }
 
@@ -49,18 +75,18 @@ func NewClusterDispatcher(dispatch dispatch.Dispatcher, options ...Option) (disp
 		fn(&opts)
 	}
 
-	var concurrencyLimit uint16 = defaultConcurrencyLimit
-	if opts.concurrencyLimit != 0 {
-		concurrencyLimit = opts.concurrencyLimit
+	chunkSize := opts.dispatchChunkSize
+	if chunkSize == 0 {
+		chunkSize = 100
+		log.Warn().Msgf("ClusterDispatcher: dispatchChunkSize not set, defaulting to %d", chunkSize)
 	}
-
-	clusterDispatch := graph.NewDispatcher(dispatch, concurrencyLimit)
+	clusterDispatch := graph.NewDispatcher(dispatch, opts.concurrencyLimits, opts.dispatchChunkSize)
 
 	if opts.prometheusSubsystem == "" {
 		opts.prometheusSubsystem = "dispatch"
 	}
 
-	cachingClusterDispatch, err := caching.NewCachingDispatcher(opts.cache, opts.prometheusSubsystem, &keys.CanonicalKeyHandler{})
+	cachingClusterDispatch, err := caching.NewCachingDispatcher(opts.cache, opts.metricsEnabled, opts.prometheusSubsystem, &keys.CanonicalKeyHandler{})
 	if err != nil {
 		return nil, err
 	}

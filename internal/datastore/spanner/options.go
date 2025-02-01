@@ -2,31 +2,59 @@ package spanner
 
 import (
 	"fmt"
+	"math"
+	"runtime"
 	"time"
+
+	"github.com/authzed/spicedb/internal/datastore/common"
+	log "github.com/authzed/spicedb/internal/logging"
 )
 
 type spannerOptions struct {
 	watchBufferLength           uint16
+	watchBufferWriteTimeout     time.Duration
 	revisionQuantization        time.Duration
 	followerReadDelay           time.Duration
 	maxRevisionStalenessPercent float64
-	gcWindow                    time.Duration
-	gcInterval                  time.Duration
-	gcEnabled                   bool
 	credentialsFilePath         string
+	credentialsJSON             []byte
 	emulatorHost                string
+	disableStats                bool
+	readMaxOpen                 int
+	writeMaxOpen                int
+	minSessions                 uint64
+	maxSessions                 uint64
+	migrationPhase              string
+	allowedMigrations           []string
+	filterMaximumIDCount        uint16
+	columnOptimizationOption    common.ColumnOptimizationOption
+	expirationDisabled          bool
+	enableDatastoreMetrics      bool
+}
+
+type migrationPhase uint8
+
+const (
+	complete migrationPhase = iota
+)
+
+var migrationPhases = map[string]migrationPhase{
+	"": complete,
 }
 
 const (
-	errQuantizationTooLarge = "revision quantization (%s) must be less than GC window (%s)"
+	errQuantizationTooLarge = "revision quantization (%s) must be less than (%s)"
 
 	defaultRevisionQuantization        = 5 * time.Second
 	defaultFollowerReadDelay           = 0 * time.Second
 	defaultMaxRevisionStalenessPercent = 0.1
 	defaultWatchBufferLength           = 128
-	defaultGCWindow                    = 60 * time.Minute
-	defaultGCInterval                  = 3 * time.Minute
-	defaultGCEnabled                   = true
+	defaultWatchBufferWriteTimeout     = 1 * time.Second
+	defaultDisableStats                = false
+	maxRevisionQuantization            = 24 * time.Hour
+	defaultFilterMaximumIDCount        = 100
+	defaultColumnOptimizationOption    = common.ColumnOptimizationOptionNone
+	defaultExpirationDisabled          = false
 )
 
 // Option provides the facility to configure how clients within the Spanner
@@ -34,14 +62,24 @@ const (
 type Option func(*spannerOptions)
 
 func generateConfig(options []Option) (spannerOptions, error) {
+	// originally SpiceDB didn't use connection pools for Spanner SDK, so it opened 1 single connection
+	// This determines if there are more CPU cores to increase the default number of connections
+	defaultNumberConnections := max(1, math.Round(float64(runtime.GOMAXPROCS(0))))
 	computed := spannerOptions{
-		gcWindow:                    defaultGCWindow,
-		gcInterval:                  defaultGCInterval,
-		gcEnabled:                   defaultGCEnabled,
 		watchBufferLength:           defaultWatchBufferLength,
+		watchBufferWriteTimeout:     defaultWatchBufferWriteTimeout,
 		revisionQuantization:        defaultRevisionQuantization,
 		followerReadDelay:           defaultFollowerReadDelay,
 		maxRevisionStalenessPercent: defaultMaxRevisionStalenessPercent,
+		disableStats:                defaultDisableStats,
+		readMaxOpen:                 int(defaultNumberConnections),
+		writeMaxOpen:                int(defaultNumberConnections),
+		minSessions:                 100,
+		maxSessions:                 400,
+		migrationPhase:              "", // no migration
+		filterMaximumIDCount:        defaultFilterMaximumIDCount,
+		columnOptimizationOption:    defaultColumnOptimizationOption,
+		expirationDisabled:          defaultExpirationDisabled,
 	}
 
 	for _, option := range options {
@@ -49,12 +87,21 @@ func generateConfig(options []Option) (spannerOptions, error) {
 	}
 
 	// Run any checks on the config that need to be done
-	if computed.revisionQuantization >= computed.gcWindow {
+	if computed.revisionQuantization >= maxRevisionQuantization {
 		return computed, fmt.Errorf(
 			errQuantizationTooLarge,
 			computed.revisionQuantization,
-			computed.gcWindow,
+			maxRevisionQuantization,
 		)
+	}
+
+	if _, ok := migrationPhases[computed.migrationPhase]; !ok {
+		return computed, fmt.Errorf("unknown migration phase: %s", computed.migrationPhase)
+	}
+
+	if computed.filterMaximumIDCount == 0 {
+		computed.filterMaximumIDCount = 100
+		log.Warn().Msg("filterMaximumIDCount not set, defaulting to 100")
 	}
 
 	return computed, nil
@@ -70,6 +117,12 @@ func WatchBufferLength(watchBufferLength uint16) Option {
 	}
 }
 
+// WatchBufferWriteTimeout is the maximum timeout for writing to the watch buffer,
+// after which the caller to the watch will be disconnected.
+func WatchBufferWriteTimeout(watchBufferWriteTimeout time.Duration) Option {
+	return func(so *spannerOptions) { so.watchBufferWriteTimeout = watchBufferWriteTimeout }
+}
+
 // RevisionQuantization is the time bucket size to which advertised revisions
 // will be rounded.
 //
@@ -80,7 +133,7 @@ func RevisionQuantization(bucketSize time.Duration) Option {
 	}
 }
 
-// FollowerReadDelay is the time delay to apply to enable historial reads.
+// FollowerReadDelay is the time delay to apply to enable historical reads.
 //
 // This value defaults to 0 seconds.
 func FollowerReadDelay(delay time.Duration) Option {
@@ -100,30 +153,19 @@ func MaxRevisionStalenessPercent(stalenessPercent float64) Option {
 	}
 }
 
-// GCWindow is the maximum age of a passed revision that will be considered
-// valid.
-//
-// This value defaults to 1 hour.
-func GCWindow(window time.Duration) Option {
-	return func(so *spannerOptions) {
-		so.gcWindow = window
-	}
-}
-
-// GCInterval is the the interval at which garbage collection will occur.
-//
-// This value defaults to 3 minutes.
-func GCInterval(interval time.Duration) Option {
-	return func(so *spannerOptions) {
-		so.gcInterval = interval
-	}
-}
-
 // CredentialsFile is the path to a file containing credentials for a service
 // account that can access the cloud spanner instance
 func CredentialsFile(path string) Option {
 	return func(so *spannerOptions) {
 		so.credentialsFilePath = path
+	}
+}
+
+// CredentialsJSON is the json containing credentials for a service
+// account that can access the cloud spanner instance
+func CredentialsJSON(json []byte) Option {
+	return func(so *spannerOptions) {
+		so.credentialsJSON = json
 	}
 }
 
@@ -135,11 +177,83 @@ func EmulatorHost(uri string) Option {
 	}
 }
 
-// GCEnabled indicates whether garbage collection is enabled.
+func EnableDatastoreMetrics(enable bool) Option {
+	return func(po *spannerOptions) {
+		po.enableDatastoreMetrics = enable
+	}
+}
+
+// DisableStats disables recording counts to the stats table
+func DisableStats(disable bool) Option {
+	return func(po *spannerOptions) {
+		po.disableStats = disable
+	}
+}
+
+// ReadConnsMaxOpen is the maximum size of the connection pool used for reads.
 //
-// GC is enabled by default.
-func GCEnabled(isGCEnabled bool) Option {
-	return func(so *spannerOptions) {
-		so.gcEnabled = isGCEnabled
+// This value defaults to having 20 connections.
+func ReadConnsMaxOpen(conns int) Option {
+	return func(po *spannerOptions) { po.readMaxOpen = conns }
+}
+
+// WriteConnsMaxOpen is the maximum size of the connection pool used for writes.
+//
+// This value defaults to having 10 connections.
+func WriteConnsMaxOpen(conns int) Option {
+	return func(po *spannerOptions) { po.writeMaxOpen = conns }
+}
+
+// MinSessionCount minimum number of session the Spanner client can have
+// at a given time.
+//
+// Defaults to 100.
+func MinSessionCount(minSessions uint64) Option {
+	return func(po *spannerOptions) { po.minSessions = minSessions }
+}
+
+// MaxSessionCount maximum number of session the Spanner client can have
+// at a given time.
+//
+// Defaults to 400 sessions.
+func MaxSessionCount(maxSessions uint64) Option {
+	return func(po *spannerOptions) { po.maxSessions = maxSessions }
+}
+
+// MigrationPhase configures the spanner driver to the proper state of a
+// multi-phase migration.
+//
+// Steady-state configuration (e.g. fully migrated) by default
+func MigrationPhase(phase string) Option {
+	return func(po *spannerOptions) { po.migrationPhase = phase }
+}
+
+// AllowedMigrations configures a set of additional migrations that will pass
+// the health check (head migration is always allowed).
+func AllowedMigrations(allowedMigrations []string) Option {
+	return func(po *spannerOptions) { po.allowedMigrations = allowedMigrations }
+}
+
+// FilterMaximumIDCount is the maximum number of IDs that can be used to filter IDs in queries
+func FilterMaximumIDCount(filterMaximumIDCount uint16) Option {
+	return func(po *spannerOptions) { po.filterMaximumIDCount = filterMaximumIDCount }
+}
+
+// WithColumnOptimization configures the Spanner driver to optimize the columns
+// in the underlying tables.
+func WithColumnOptimization(isEnabled bool) Option {
+	return func(po *spannerOptions) {
+		if isEnabled {
+			po.columnOptimizationOption = common.ColumnOptimizationOptionStaticValues
+		} else {
+			po.columnOptimizationOption = common.ColumnOptimizationOptionNone
+		}
+	}
+}
+
+// WithExpirationDisabled disables relationship expiration support in the Spanner.
+func WithExpirationDisabled(isDisabled bool) Option {
+	return func(po *spannerOptions) {
+		po.expirationDisabled = isDisabled
 	}
 }

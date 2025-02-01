@@ -11,9 +11,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/authzed/spicedb/internal/datastore/options"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 )
 
@@ -133,7 +133,7 @@ func NewHedgingProxy(
 	initialSlowRequestThreshold time.Duration,
 	maxSampleCount uint64,
 	hedgingQuantile float64,
-) datastore.Datastore {
+) (datastore.Datastore, error) {
 	return newHedgingProxyWithTimeSource(
 		delegate,
 		initialSlowRequestThreshold,
@@ -149,17 +149,17 @@ func newHedgingProxyWithTimeSource(
 	maxSampleCount uint64,
 	hedgingQuantile float64,
 	timeSource clock.Clock,
-) datastore.Datastore {
+) (datastore.Datastore, error) {
 	if initialSlowRequestThreshold < 0 {
-		panic("initial slow request threshold negative")
+		return nil, fmt.Errorf("initial slow request threshold negative")
 	}
 
 	if maxSampleCount < minMaxRequestsThreshold {
-		panic(fmt.Sprintf("maxSampleCount must be >=%d", minMaxRequestsThreshold))
+		return nil, fmt.Errorf("maxSampleCount must be >=%d", minMaxRequestsThreshold)
 	}
 
 	if hedgingQuantile <= 0.0 || hedgingQuantile >= 1.0 {
-		panic("hedingQuantile must be in the range (0.0-1.0) exclusive")
+		return nil, fmt.Errorf("hedgingQuantile must be in the range (0.0-1.0) exclusive")
 	}
 
 	return hedgingProxy{
@@ -168,7 +168,11 @@ func newHedgingProxyWithTimeSource(
 		newHedger(timeSource, initialSlowRequestThreshold, maxSampleCount, hedgingQuantile),
 		newHedger(timeSource, initialSlowRequestThreshold, maxSampleCount, hedgingQuantile),
 		newHedger(timeSource, initialSlowRequestThreshold, maxSampleCount, hedgingQuantile),
-	}
+	}, nil
+}
+
+func (hp hedgingProxy) Unwrap() datastore.Datastore {
+	return hp.Datastore
 }
 
 func (hp hedgingProxy) OptimizedRevision(ctx context.Context) (rev datastore.Revision, err error) {
@@ -214,13 +218,13 @@ type hedgingReader struct {
 	p hedgingProxy
 }
 
-func (hp hedgingReader) ReadNamespace(
+func (hp hedgingReader) ReadNamespaceByName(
 	ctx context.Context,
 	nsName string,
 ) (ns *core.NamespaceDefinition, createdAt datastore.Revision, err error) {
 	var once sync.Once
 	subreq := func(ctx context.Context, responseReady chan<- struct{}) {
-		delegatedNs, delegatedRev, delegatedErr := hp.Reader.ReadNamespace(ctx, nsName)
+		delegatedNs, delegatedRev, delegatedErr := hp.Reader.ReadNamespaceByName(ctx, nsName)
 		once.Do(func() {
 			ns = delegatedNs
 			createdAt = delegatedRev
@@ -246,11 +250,11 @@ func (hp hedgingReader) QueryRelationships(
 
 func (hp hedgingReader) ReverseQueryRelationships(
 	ctx context.Context,
-	subjectFilter datastore.SubjectsFilter,
+	subjectsFilter datastore.SubjectsFilter,
 	opts ...options.ReverseQueryOptionsOption,
 ) (iter datastore.RelationshipIterator, err error) {
 	return hp.executeQuery(ctx, func(c context.Context) (datastore.RelationshipIterator, error) {
-		return hp.Reader.ReverseQueryRelationships(ctx, subjectFilter, opts...)
+		return hp.Reader.ReverseQueryRelationships(ctx, subjectsFilter, opts...)
 	})
 }
 
@@ -271,7 +275,9 @@ func (hp hedgingReader) executeQuery(
 		// only the first call to once.Do will run the function, so whichever
 		// hedged request is slower will have resultsUsed = false
 		if !resultsUsed && tempErr == nil {
-			tempIterator.Close()
+			for range tempIterator {
+				break
+			}
 		}
 		responseReady <- struct{}{}
 	}

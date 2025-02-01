@@ -4,11 +4,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/authzed/spicedb/pkg/development"
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	devinterface "github.com/authzed/spicedb/pkg/proto/developer/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/generator"
@@ -18,7 +18,11 @@ import (
 func runOperation(devContext *development.DevContext, operation *devinterface.Operation) (*devinterface.OperationResult, error) {
 	switch {
 	case operation.FormatSchemaParameters != nil:
-		formatted, _ := generator.GenerateSchema(devContext.CompiledSchema.OrderedDefinitions)
+		formatted, _, err := generator.GenerateSchema(devContext.CompiledSchema.OrderedDefinitions)
+		if err != nil {
+			return nil, err
+		}
+
 		trimmed := strings.TrimSpace(formatted)
 		return &devinterface.OperationResult{
 			FormatSchemaResult: &devinterface.FormatSchemaResult{
@@ -27,16 +31,28 @@ func runOperation(devContext *development.DevContext, operation *devinterface.Op
 		}, nil
 
 	case operation.CheckParameters != nil:
-		result, err := development.RunCheck(devContext, operation.CheckParameters.Resource, operation.CheckParameters.Subject)
+		var caveatContext map[string]any
+		if operation.CheckParameters.CaveatContext != nil {
+			caveatContext = operation.CheckParameters.CaveatContext.AsMap()
+		}
+
+		cr, err := development.RunCheck(
+			devContext,
+			tuple.FromCoreObjectAndRelation(operation.CheckParameters.Resource),
+			tuple.FromCoreObjectAndRelation(operation.CheckParameters.Subject),
+			caveatContext,
+		)
 		if err != nil {
 			devErr, wireErr := development.DistinguishGraphError(
 				devContext,
 				err,
 				devinterface.DeveloperError_CHECK_WATCH,
 				0, 0,
-				tuple.String(&core.RelationTuple{
-					ResourceAndRelation: operation.CheckParameters.Resource,
-					Subject:             operation.CheckParameters.Subject,
+				tuple.MustString(tuple.Relationship{
+					RelationshipReference: tuple.RelationshipReference{
+						Resource: tuple.FromCoreObjectAndRelation(operation.CheckParameters.Resource),
+						Subject:  tuple.FromCoreObjectAndRelation(operation.CheckParameters.Subject),
+					},
 				}),
 			)
 			if wireErr != nil {
@@ -50,15 +66,21 @@ func runOperation(devContext *development.DevContext, operation *devinterface.Op
 			}, nil
 		}
 
-		// TODO(jschorr): Support caveats here.
 		membership := devinterface.CheckOperationsResult_NOT_MEMBER
-		if result == v1.ResourceCheckResult_MEMBER {
+		if cr.Permissionship == v1.ResourceCheckResult_MEMBER {
 			membership = devinterface.CheckOperationsResult_MEMBER
+		} else if cr.Permissionship == v1.ResourceCheckResult_CAVEATED_MEMBER {
+			membership = devinterface.CheckOperationsResult_CAVEATED_MEMBER
 		}
 
 		return &devinterface.OperationResult{
 			CheckResult: &devinterface.CheckOperationsResult{
-				Membership: membership,
+				Membership:               membership,
+				DebugInformation:         cr.DispatchDebugInfo,
+				ResolvedDebugInformation: cr.V1DebugInfo,
+				PartialCaveatInfo: &devinterface.PartialCaveatInfo{
+					MissingRequiredContext: cr.MissingCaveatFields,
+				},
 			},
 		}, nil
 
@@ -111,6 +133,18 @@ func runOperation(devContext *development.DevContext, operation *devinterface.Op
 			ValidationResult: &devinterface.RunValidationResult{
 				UpdatedValidationYaml: updatedValidationYaml,
 				ValidationErrors:      validationErrors,
+			},
+		}, nil
+
+	case operation.SchemaWarningsParameters != nil:
+		warnings, err := development.GetWarnings(context.Background(), devContext)
+		if err != nil {
+			return nil, err
+		}
+
+		return &devinterface.OperationResult{
+			SchemaWarningsResult: &devinterface.SchemaWarningsResult{
+				Warnings: warnings,
 			},
 		}, nil
 

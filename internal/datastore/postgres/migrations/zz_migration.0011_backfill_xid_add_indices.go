@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/migrate"
@@ -129,13 +129,13 @@ func init() {
 			for _, stmt := range backfills {
 				concreteStmt := fmt.Sprintf(stmt, batchSize)
 
-				log.Info().Str("statement", concreteStmt).Msg("starting backfill")
+				log.Ctx(ctx).Info().Str("statement", concreteStmt).Msg("starting backfill")
 
 				var r pgconn.CommandTag
 				var err error
 
 				for r, err = conn.Exec(ctx, concreteStmt); err == nil && r.RowsAffected() > 0; r, err = conn.Exec(ctx, concreteStmt) {
-					log.Debug().Int64("count", r.RowsAffected()).Msg("updated rows")
+					log.Ctx(ctx).Debug().Int64("count", r.RowsAffected()).Msg("updated rows")
 				}
 				if err != nil {
 					return err

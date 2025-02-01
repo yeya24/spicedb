@@ -33,17 +33,15 @@ type Wrapper struct {
 }
 
 // NewSpannerDriver returns a migration driver for the given Cloud Spanner instance
-func NewSpannerDriver(database, credentialsFilePath, emulatorHost string) (*SpannerMigrationDriver, error) {
-	ctx := context.Background()
-
+func NewSpannerDriver(ctx context.Context, database, credentialsFilePath, emulatorHost string) (*SpannerMigrationDriver, error) {
 	if len(emulatorHost) > 0 {
 		err := os.Setenv(emulatorSettingKey, emulatorHost)
 		if err != nil {
 			return nil, err
 		}
 	}
-	log.Info().Str("spanner-emulator-host", os.Getenv(emulatorSettingKey)).Msg("spanner emulator")
-	log.Info().Str("credentials", credentialsFilePath).Str("db", database).Msg("connecting")
+	log.Ctx(ctx).Info().Str("spanner-emulator-host", os.Getenv(emulatorSettingKey)).Msg("spanner emulator")
+	log.Ctx(ctx).Info().Str("credentials", credentialsFilePath).Str("db", database).Msg("connecting")
 	client, err := spanner.NewClient(ctx, database, option.WithCredentialsFile(credentialsFilePath))
 	if err != nil {
 		return nil, err
@@ -57,24 +55,33 @@ func NewSpannerDriver(database, credentialsFilePath, emulatorHost string) (*Span
 	return &SpannerMigrationDriver{client, adminClient}, nil
 }
 
+// VersionProvider returns the migration version a specific spanner datastore is running at
+type VersionProvider interface {
+	Version(ctx context.Context) (string, error)
+}
+
+// NewSpannerVersionChecker returns a VersionProvider for the argument spanner.Client
+func NewSpannerVersionChecker(c *spanner.Client) VersionProvider {
+	return &SpannerMigrationDriver{c, nil}
+}
+
 func (smd *SpannerMigrationDriver) Version(ctx context.Context) (string, error) {
-	rows := smd.client.Single().Read(
+	var schemaRevision string
+	iter := smd.client.Single().Read(
 		ctx,
 		tableSchemaVersion,
 		spanner.AllKeys(),
 		[]string{colVersionNum},
 	)
-	row, err := rows.Next()
-	if err != nil {
+	defer iter.Stop()
+
+	if err := iter.Do(func(r *spanner.Row) error {
+		return r.Columns(&schemaRevision)
+	}); err != nil {
 		if spanner.ErrCode(err) == codes.NotFound {
 			// There is no schema table, empty database
 			return "", nil
 		}
-		return "", err
-	}
-
-	var schemaRevision string
-	if err := row.Columns(&schemaRevision); err != nil {
 		return "", err
 	}
 
@@ -96,7 +103,7 @@ func (smd *SpannerMigrationDriver) RunTx(ctx context.Context, f migrate.TxMigrat
 func (smd *SpannerMigrationDriver) WriteVersion(_ context.Context, rwt *spanner.ReadWriteTransaction, version, replaced string) error {
 	return rwt.BufferWrite([]*spanner.Mutation{
 		spanner.Delete(tableSchemaVersion, spanner.KeySetFromKeys(spanner.Key{replaced})),
-		spanner.Insert(tableSchemaVersion, []string{colVersionNum}, []interface{}{version}),
+		spanner.Insert(tableSchemaVersion, []string{colVersionNum}, []any{version}),
 	})
 }
 

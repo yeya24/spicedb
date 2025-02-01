@@ -13,9 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/go-logr/zerologr"
-	grpczerolog "github.com/grpc-ecosystem/go-grpc-middleware/providers/zerolog/v2"
 	grpclog "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
-	grpcprom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/jzelinskie/cobrautil/v2"
 	"github.com/jzelinskie/cobrautil/v2/cobragrpc"
 	"github.com/jzelinskie/cobrautil/v2/cobrahttp"
@@ -29,6 +27,8 @@ import (
 	log "github.com/authzed/spicedb/internal/logging"
 	v0svc "github.com/authzed/spicedb/internal/services/v0"
 	"github.com/authzed/spicedb/pkg/cmd/server"
+	"github.com/authzed/spicedb/pkg/cmd/termination"
+	"github.com/authzed/spicedb/pkg/cmd/util"
 )
 
 func RegisterDevtoolsFlags(cmd *cobra.Command) {
@@ -43,6 +43,8 @@ func RegisterDevtoolsFlags(cmd *cobra.Command) {
 	cmd.Flags().String("s3-bucket", "", "s3 bucket name for s3 share store")
 	cmd.Flags().String("s3-endpoint", "", "s3 endpoint for s3 share store")
 	cmd.Flags().String("s3-region", "auto", "s3 region for s3 share store")
+
+	util.RegisterCommonFlags(cmd)
 }
 
 func NewDevtoolsCommand(programName string) *cobra.Command {
@@ -51,33 +53,34 @@ func NewDevtoolsCommand(programName string) *cobra.Command {
 		Short:   "runs the developer tools service",
 		Long:    "Serves the authzed.api.v0.DeveloperService which is used for development tooling such as the Authzed Playground",
 		PreRunE: server.DefaultPreRunE(programName),
-		RunE:    runfunc,
+		RunE:    termination.PublishError(runfunc),
 		Args:    cobra.ExactArgs(0),
 	}
 }
 
 func runfunc(cmd *cobra.Command, _ []string) error {
+	grpcUnaryInterceptor, _ := server.GRPCMetrics(false)
 	grpcBuilder := grpcServiceBuilder()
 	grpcServer, err := grpcBuilder.ServerFromFlags(cmd,
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.ChainUnaryInterceptor(
-			grpclog.UnaryServerInterceptor(grpczerolog.InterceptorLogger(log.Logger)),
-			otelgrpc.UnaryServerInterceptor(),
-			grpcprom.UnaryServerInterceptor,
+			grpclog.UnaryServerInterceptor(server.InterceptorLogger(log.Logger)),
+			grpcUnaryInterceptor,
 		))
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to create gRPC server")
+		log.Ctx(cmd.Context()).Fatal().Err(err).Msg("failed to create gRPC server")
 	}
 
 	shareStore, err := shareStoreFromCmd(cmd)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to configure share store")
+		log.Ctx(cmd.Context()).Fatal().Err(err).Msg("failed to configure share store")
 	}
 
 	registerDeveloperGrpcServices(grpcServer, shareStore)
 
 	go func() {
 		if err := grpcBuilder.ListenFromFlags(cmd, grpcServer); err != nil {
-			log.Warn().Err(err).Msg("gRPC service did not shutdown cleanly")
+			log.Ctx(cmd.Context()).Warn().Err(err).Msg("gRPC service did not shutdown cleanly")
 		}
 	}()
 
@@ -86,7 +89,7 @@ func runfunc(cmd *cobra.Command, _ []string) error {
 	metricsSrv := metricsHTTP.ServerFromFlags(cmd)
 	go func() {
 		if err := metricsHTTP.ListenFromFlags(cmd, metricsSrv); err != nil {
-			log.Fatal().Err(err).Msg("failed while serving metrics")
+			log.Ctx(cmd.Context()).Fatal().Err(err).Msg("failed while serving metrics")
 		}
 	}()
 
@@ -96,19 +99,19 @@ func runfunc(cmd *cobra.Command, _ []string) error {
 	downloadSrv.ReadHeaderTimeout = 5 * time.Second
 	go func() {
 		if err := downloadHTTP.ListenFromFlags(cmd, downloadSrv); err != nil {
-			log.Fatal().Err(err).Msg("failed while serving download http api")
+			log.Ctx(cmd.Context()).Fatal().Err(err).Msg("failed while serving download http api")
 		}
 	}()
 	signalctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
 	<-signalctx.Done()
-	log.Info().Msg("received interrupt")
+	log.Ctx(cmd.Context()).Info().Msg("received interrupt")
 	grpcServer.GracefulStop()
 	if err := metricsSrv.Close(); err != nil {
-		log.Err(err).Msg("failed while shutting down metrics server")
+		log.Ctx(cmd.Context()).Err(err).Msg("failed while shutting down metrics server")
 		return err
 	}
 	if err := downloadSrv.Close(); err != nil {
-		log.Err(err).Msg("failed while shutting down download server")
+		log.Ctx(cmd.Context()).Err(err).Msg("failed while shutting down download server")
 		return err
 	}
 
@@ -126,7 +129,7 @@ func httpMetricsServiceBuilder() *cobrahttp.Builder {
 	return cobrahttp.New("metrics",
 		cobrahttp.WithLogger(zerologr.New(&log.Logger)),
 		cobrahttp.WithFlagPrefix("metrics"),
-		cobrahttp.WithHandler(server.MetricsHandler(server.DisableTelemetryHandler)),
+		cobrahttp.WithHandler(server.MetricsHandler(server.DisableTelemetryHandler, nil)),
 	)
 }
 
@@ -141,7 +144,7 @@ func grpcServiceBuilder() *cobragrpc.Builder {
 func shareStoreFromCmd(cmd *cobra.Command) (v0svc.ShareStore, error) {
 	shareStoreSalt := cobrautil.MustGetStringExpanded(cmd, "share-store-salt")
 	shareStoreKind := cobrautil.MustGetStringExpanded(cmd, "share-store")
-	event := log.Info()
+	event := log.Ctx(cmd.Context()).Info()
 
 	var shareStore v0svc.ShareStore
 	switch shareStoreKind {

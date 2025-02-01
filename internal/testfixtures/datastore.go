@@ -4,18 +4,20 @@ import (
 	"context"
 
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/authzed/spicedb/internal/datastore/common"
 	"github.com/authzed/spicedb/internal/namespace"
 	"github.com/authzed/spicedb/pkg/caveats"
 	caveattypes "github.com/authzed/spicedb/pkg/caveats/types"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	ns "github.com/authzed/spicedb/pkg/namespace"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/compiler"
 	"github.com/authzed/spicedb/pkg/schemadsl/input"
 	"github.com/authzed/spicedb/pkg/tuple"
+	"github.com/authzed/spicedb/pkg/typesystem"
 )
 
 var UserNS = ns.Namespace("user")
@@ -31,41 +33,47 @@ var CaveatDef = ns.MustCaveatDefinition(
 
 var DocumentNS = ns.Namespace(
 	"document",
-	ns.Relation("owner",
+	ns.MustRelation("owner",
+		nil,
+		ns.AllowedRelation("user", "..."),
+		ns.AllowedRelationWithCaveat("user", "...", ns.AllowedCaveat("test")),
+	),
+	ns.MustRelation("editor",
 		nil,
 		ns.AllowedRelation("user", "..."),
 	),
-	ns.Relation("editor",
+	ns.MustRelation("viewer",
+		nil,
+		ns.AllowedRelation("user", "..."),
+		ns.AllowedRelationWithCaveat("user", "...", ns.AllowedCaveat("test")),
+	),
+	ns.MustRelation("viewer_and_editor",
 		nil,
 		ns.AllowedRelation("user", "..."),
 	),
-	ns.Relation("viewer",
-		nil,
-		ns.AllowedRelation("user", "..."),
-	),
-	ns.Relation("viewer_and_editor",
-		nil,
-		ns.AllowedRelation("user", "..."),
-	),
-	ns.Relation("caveated_viewer",
+	ns.MustRelation("caveated_viewer",
 		nil,
 		ns.AllowedRelationWithCaveat("user", "...", ns.AllowedCaveat("test")),
 	),
-	ns.Relation("parent", nil, ns.AllowedRelation("folder", "...")),
-	ns.Relation("edit",
+	ns.MustRelation("expiring_viewer",
+		nil,
+		ns.AllowedRelationWithExpiration("user", "..."),
+	),
+	ns.MustRelation("parent", nil, ns.AllowedRelation("folder", "...")),
+	ns.MustRelation("edit",
 		ns.Union(
 			ns.ComputedUserset("owner"),
 			ns.ComputedUserset("editor"),
 		),
 	),
-	ns.Relation("view",
+	ns.MustRelation("view",
 		ns.Union(
 			ns.ComputedUserset("viewer"),
 			ns.ComputedUserset("edit"),
 			ns.TupleToUserset("parent", "view"),
 		),
 	),
-	ns.Relation("view_and_edit",
+	ns.MustRelation("view_and_edit",
 		ns.Intersection(
 			ns.ComputedUserset("viewer_and_editor"),
 			ns.ComputedUserset("edit"),
@@ -75,27 +83,29 @@ var DocumentNS = ns.Namespace(
 
 var FolderNS = ns.Namespace(
 	"folder",
-	ns.Relation("owner",
+	ns.MustRelation("owner",
+		nil,
+		ns.AllowedRelation("user", "..."),
+		ns.AllowedRelationWithCaveat("user", "...", ns.AllowedCaveat("test")),
+	),
+	ns.MustRelation("editor",
 		nil,
 		ns.AllowedRelation("user", "..."),
 	),
-	ns.Relation("editor",
-		nil,
-		ns.AllowedRelation("user", "..."),
-	),
-	ns.Relation("viewer",
+	ns.MustRelation("viewer",
 		nil,
 		ns.AllowedRelation("user", "..."),
 		ns.AllowedRelation("folder", "viewer"),
+		ns.AllowedRelationWithCaveat("folder", "viewer", ns.AllowedCaveat("test")),
 	),
-	ns.Relation("parent", nil, ns.AllowedRelation("folder", "...")),
-	ns.Relation("edit",
+	ns.MustRelation("parent", nil, ns.AllowedRelation("folder", "...")),
+	ns.MustRelation("edit",
 		ns.Union(
 			ns.ComputedUserset("editor"),
 			ns.ComputedUserset("owner"),
 		),
 	),
-	ns.Relation("view",
+	ns.MustRelation("view",
 		ns.Union(
 			ns.ComputedUserset("viewer"),
 			ns.ComputedUserset("edit"),
@@ -104,7 +114,10 @@ var FolderNS = ns.Namespace(
 	),
 )
 
-var StandardTuples = []string{
+// StandardRelationships defines standard relationships for tests.
+// NOTE: some tests index directly into this slice, so if you're adding a new relationship, add it
+// at the *end*.
+var StandardRelationships = []string{
 	"document:companyplan#parent@folder:company#...",
 	"document:masterplan#parent@folder:strategy#...",
 	"folder:strategy#parent@folder:company#...",
@@ -122,6 +135,13 @@ var StandardTuples = []string{
 	"document:specialplan#viewer_and_editor@user:multiroleguy#...",
 	"document:specialplan#editor@user:multiroleguy#...",
 	"document:specialplan#viewer_and_editor@user:missingrolegal#...",
+	"document:base64YWZzZGZh-ZHNmZHPwn5iK8J+YivC/fmIrwn5iK==#owner@user:base64YWZzZGZh-ZHNmZHPwn5iK8J+YivC/fmIrwn5iK==#...",
+	"document:veryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryverylong#owner@user:veryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryverylong#...",
+	"document:ownerplan#viewer@user:owner#...",
+}
+
+var StandardCaveatedRelationships = []string{
+	"document:caveatedplan#caveated_viewer@user:caveatedguy#...[test:{\"expectedSecret\":\"1234\"}]",
 }
 
 // EmptyDatastore returns an empty datastore for testing.
@@ -144,13 +164,14 @@ func StandardDatastoreWithData(ds datastore.Datastore, require *require.Assertio
 	ds, _ = StandardDatastoreWithSchema(ds, require)
 	ctx := context.Background()
 
-	tuples := make([]*core.RelationTuple, 0, len(StandardTuples))
-	for _, tupleStr := range StandardTuples {
-		tpl := tuple.Parse(tupleStr)
-		require.NotNil(tpl)
-		tuples = append(tuples, tpl)
+	rels := make([]tuple.Relationship, 0, len(StandardRelationships))
+	for _, tupleStr := range StandardRelationships {
+		rel, err := tuple.Parse(tupleStr)
+		require.NoError(err)
+		require.NotNil(rel)
+		rels = append(rels, rel)
 	}
-	revision, err := common.WriteTuples(ctx, ds, core.RelationTupleUpdate_CREATE, tuples...)
+	revision, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
 	require.NoError(err)
 
 	return ds, revision
@@ -162,22 +183,26 @@ func StandardDatastoreWithCaveatedData(ds datastore.Datastore, require *require.
 	ds, _ = StandardDatastoreWithSchema(ds, require)
 	ctx := context.Background()
 
-	_, err := ds.ReadWriteTx(ctx, func(tx datastore.ReadWriteTransaction) error {
+	_, err := ds.ReadWriteTx(ctx, func(ctx context.Context, tx datastore.ReadWriteTransaction) error {
 		return tx.WriteCaveats(ctx, createTestCaveat(require))
 	})
 	require.NoError(err)
 
-	caveatedTpls := make([]*core.RelationTuple, 0, len(StandardTuples))
-	for _, tupleStr := range StandardTuples {
-		tpl := tuple.Parse(tupleStr)
-		require.NotNil(tpl)
-		tpl.Caveat = &core.ContextualizedCaveat{
-			CaveatName: "test",
-			Context:    mustProtoStruct(map[string]any{"expectedSecret": "1234"}),
-		}
-		caveatedTpls = append(caveatedTpls, tpl)
+	rels := make([]tuple.Relationship, 0, len(StandardRelationships)+len(StandardCaveatedRelationships))
+	for _, tupleStr := range StandardRelationships {
+		rel, err := tuple.Parse(tupleStr)
+		require.NoError(err)
+		require.NotNil(rel)
+		rels = append(rels, rel)
 	}
-	revision, err := common.WriteTuples(ctx, ds, core.RelationTupleUpdate_CREATE, caveatedTpls...)
+	for _, tupleStr := range StandardCaveatedRelationships {
+		rel, err := tuple.Parse(tupleStr)
+		require.NoError(err)
+		require.NotNil(rel)
+		rels = append(rels, rel)
+	}
+
+	revision, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
 	require.NoError(err)
 
 	return ds, revision
@@ -205,23 +230,22 @@ func createTestCaveat(require *require.Assertions) []*core.CaveatDefinition {
 
 // DatastoreFromSchemaAndTestRelationships returns a validating datastore wrapping that specified,
 // loaded with the given scehma and relationships.
-func DatastoreFromSchemaAndTestRelationships(ds datastore.Datastore, schema string, relationships []*core.RelationTuple, require *require.Assertions) (datastore.Datastore, datastore.Revision) {
+func DatastoreFromSchemaAndTestRelationships(ds datastore.Datastore, schema string, relationships []tuple.Relationship, require *require.Assertions) (datastore.Datastore, datastore.Revision) {
 	ctx := context.Background()
 	validating := NewValidatingDatastore(ds)
 
-	emptyDefaultPrefix := ""
 	compiled, err := compiler.Compile(compiler.InputSchema{
 		Source:       input.Source("schema"),
 		SchemaString: schema,
-	}, &emptyDefaultPrefix)
+	}, compiler.AllowUnprefixedObjectType())
 	require.NoError(err)
 
 	_ = writeDefinitions(validating, require, compiled.ObjectDefinitions, compiled.CaveatDefinitions)
 
-	newRevision, err := validating.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
-		mutations := make([]*core.RelationTupleUpdate, 0, len(relationships))
+	newRevision, err := validating.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		mutations := make([]tuple.RelationshipUpdate, 0, len(relationships))
 		for _, rel := range relationships {
-			mutations = append(mutations, tuple.Create(rel.CloneVT()))
+			mutations = append(mutations, tuple.Create(rel))
 		}
 		err = rwt.WriteRelationships(ctx, mutations)
 		require.NoError(err)
@@ -235,15 +259,15 @@ func DatastoreFromSchemaAndTestRelationships(ds datastore.Datastore, schema stri
 
 func writeDefinitions(ds datastore.Datastore, require *require.Assertions, objectDefs []*core.NamespaceDefinition, caveatDefs []*core.CaveatDefinition) datastore.Revision {
 	ctx := context.Background()
-	newRevision, err := ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	newRevision, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		if len(caveatDefs) > 0 {
 			err := rwt.WriteCaveats(ctx, caveatDefs)
 			require.NoError(err)
 		}
 
 		for _, nsDef := range objectDefs {
-			ts, err := namespace.NewNamespaceTypeSystem(nsDef,
-				namespace.ResolverForDatastoreReader(rwt).WithPredefinedElements(namespace.PredefinedElements{
+			ts, err := typesystem.NewNamespaceTypeSystem(nsDef,
+				typesystem.ResolverForDatastoreReader(rwt).WithPredefinedElements(typesystem.PredefinedElements{
 					Namespaces: objectDefs,
 					Caveats:    caveatDefs,
 				}))
@@ -265,66 +289,78 @@ func writeDefinitions(ds datastore.Datastore, require *require.Assertions, objec
 	return newRevision
 }
 
-// TupleChecker is a helper type which provides an easy way for collecting relationships/tuples from
+// RelationshipChecker is a helper type which provides an easy way for collecting relationships from
 // an iterator and verify those found.
-type TupleChecker struct {
+type RelationshipChecker struct {
 	Require *require.Assertions
 	DS      datastore.Datastore
 }
 
-func (tc TupleChecker) ExactRelationshipIterator(ctx context.Context, tpl *core.RelationTuple, rev datastore.Revision) datastore.RelationshipIterator {
-	filter := tuple.MustToFilter(tpl)
-	iter, err := tc.DS.SnapshotReader(rev).QueryRelationships(ctx, datastore.RelationshipsFilterFromPublicFilter(filter))
+func (tc RelationshipChecker) ExactRelationshipIterator(ctx context.Context, rel tuple.Relationship, rev datastore.Revision) datastore.RelationshipIterator {
+	filter := tuple.ToV1Filter(rel)
+	dsFilter, err := datastore.RelationshipsFilterFromPublicFilter(filter)
+	tc.Require.NoError(err)
+
+	iter, err := tc.DS.SnapshotReader(rev).QueryRelationships(ctx, dsFilter)
 	tc.Require.NoError(err)
 	return iter
 }
 
-func (tc TupleChecker) VerifyIteratorCount(iter datastore.RelationshipIterator, count int) {
-	defer iter.Close()
-
+func (tc RelationshipChecker) VerifyIteratorCount(iter datastore.RelationshipIterator, count int) {
 	foundCount := 0
-	for found := iter.Next(); found != nil; found = iter.Next() {
+	for _, err := range iter {
+		tc.Require.NoError(err)
 		foundCount++
 	}
-	tc.Require.NoError(iter.Err())
 	tc.Require.Equal(count, foundCount)
 }
 
-func (tc TupleChecker) VerifyIteratorResults(iter datastore.RelationshipIterator, tpls ...*core.RelationTuple) {
-	defer iter.Close()
-
-	toFind := make(map[string]struct{}, 1024)
-
-	for _, tpl := range tpls {
-		toFind[tuple.String(tpl)] = struct{}{}
+func (tc RelationshipChecker) VerifyIteratorResults(iter datastore.RelationshipIterator, rels ...tuple.Relationship) {
+	toFind := mapz.NewSet[string]()
+	for _, rel := range rels {
+		toFind.Add(tuple.MustString(rel))
 	}
 
-	for found := iter.Next(); found != nil; found = iter.Next() {
-		tc.Require.NoError(iter.Err())
-		foundStr := tuple.String(found)
-		_, ok := toFind[foundStr]
-		tc.Require.True(ok, "found unexpected tuple %s in iterator", foundStr)
-		delete(toFind, foundStr)
+	for found, err := range iter {
+		tc.Require.NoError(err)
+
+		foundStr := tuple.MustString(found)
+		tc.Require.True(toFind.Has(foundStr), "found unexpected relationship %s in iterator", foundStr)
+		toFind.Delete(foundStr)
 	}
-	tc.Require.NoError(iter.Err())
 
-	tc.Require.Zero(len(toFind), "did not find some expected tuples: %#v", toFind)
+	tc.Require.True(toFind.IsEmpty(), "did not find some expected relationships: %#v", toFind.AsSlice())
 }
 
-func (tc TupleChecker) TupleExists(ctx context.Context, tpl *core.RelationTuple, rev datastore.Revision) {
-	iter := tc.ExactRelationshipIterator(ctx, tpl, rev)
-	tc.VerifyIteratorResults(iter, tpl)
+func (tc RelationshipChecker) VerifyOrderedIteratorResults(iter datastore.RelationshipIterator, rels ...tuple.Relationship) options.Cursor {
+	expected := make([]tuple.Relationship, 0, len(rels))
+	for rel, err := range iter {
+		tc.Require.NoError(err)
+		expected = append(expected, rel)
+	}
+
+	var cursor options.Cursor
+	for index, rel := range rels {
+		expectedStr := tuple.MustString(rel)
+
+		if index > len(expected)-1 {
+			tc.Require.Fail("expected %s, but found no additional results", expectedStr)
+		}
+
+		foundStr := tuple.MustString(expected[index])
+		tc.Require.Equal(expectedStr, foundStr)
+
+		cursor = options.ToCursor(rel)
+	}
+	return cursor
 }
 
-func (tc TupleChecker) NoTupleExists(ctx context.Context, tpl *core.RelationTuple, rev datastore.Revision) {
-	iter := tc.ExactRelationshipIterator(ctx, tpl, rev)
+func (tc RelationshipChecker) RelationshipExists(ctx context.Context, rel tuple.Relationship, rev datastore.Revision) {
+	iter := tc.ExactRelationshipIterator(ctx, rel, rev)
+	tc.VerifyIteratorResults(iter, rel)
+}
+
+func (tc RelationshipChecker) NoRelationshipExists(ctx context.Context, rel tuple.Relationship, rev datastore.Revision) {
+	iter := tc.ExactRelationshipIterator(ctx, rel, rev)
 	tc.VerifyIteratorResults(iter)
-}
-
-func mustProtoStruct(in map[string]any) *structpb.Struct {
-	out, err := structpb.NewStruct(in)
-	if err != nil {
-		panic(err)
-	}
-	return out
 }

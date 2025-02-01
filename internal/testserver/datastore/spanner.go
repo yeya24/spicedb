@@ -11,12 +11,13 @@ import (
 	"time"
 
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instances "cloud.google.com/go/spanner/admin/instance/apiv1"
+	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"github.com/google/uuid"
 	"github.com/ory/dockertest/v3"
+	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/require"
-	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
-	"google.golang.org/genproto/googleapis/spanner/admin/instance/v1"
 
 	"github.com/authzed/spicedb/internal/datastore/spanner/migrations"
 	"github.com/authzed/spicedb/pkg/datastore"
@@ -25,21 +26,26 @@ import (
 )
 
 type spannerTest struct {
-	hostname string
+	hostname        string
+	targetMigration string
 }
 
 // RunSpannerForTesting returns a RunningEngineForTest for spanner
-func RunSpannerForTesting(t testing.TB, bridgeNetworkName string) RunningEngineForTest {
+func RunSpannerForTesting(t testing.TB, bridgeNetworkName string, targetMigration string) RunningEngineForTest {
 	pool, err := dockertest.NewPool("")
 	require.NoError(t, err)
 
-	name := fmt.Sprintf("postgres-%s", uuid.New().String())
+	name := fmt.Sprintf("spanner-%s", uuid.New().String())
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Name:         name,
 		Repository:   "gcr.io/cloud-spanner-emulator/emulator",
-		Tag:          "latest",
+		Tag:          "1.5.11",
 		ExposedPorts: []string{"9010/tcp"},
 		NetworkID:    bridgeNetworkName,
+	}, func(config *docker.HostConfig) {
+		// set AutoRemove to true so that stopped container goes away by itself
+		config.AutoRemove = true
+		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
 	})
 	require.NoError(t, err)
 
@@ -63,10 +69,10 @@ func RunSpannerForTesting(t testing.TB, bridgeNetworkName string) RunningEngineF
 
 		ctx, cancel = context.WithTimeout(context.Background(), dockerBootTimeout)
 		defer cancel()
-		_, err = instancesClient.CreateInstance(ctx, &instance.CreateInstanceRequest{
+		_, err = instancesClient.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 			Parent:     "projects/fake-project-id",
 			InstanceId: "init",
-			Instance: &instance.Instance{
+			Instance: &instancepb.Instance{
 				Config:      "emulator-config",
 				DisplayName: "Test Instance",
 				NodeCount:   1,
@@ -75,7 +81,9 @@ func RunSpannerForTesting(t testing.TB, bridgeNetworkName string) RunningEngineF
 		return err
 	}))
 
-	builder := &spannerTest{}
+	builder := &spannerTest{
+		targetMigration: targetMigration,
+	}
 	if bridgeNetworkName != "" {
 		builder.hostname = name
 	}
@@ -102,10 +110,10 @@ func (b *spannerTest) NewDatabase(t testing.TB) string {
 	require.NoError(t, err)
 	defer instancesClient.Close()
 
-	createInstanceOp, err := instancesClient.CreateInstance(ctx, &instance.CreateInstanceRequest{
+	createInstanceOp, err := instancesClient.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 		Parent:     "projects/fake-project-id",
 		InstanceId: newInstanceName,
-		Instance: &instance.Instance{
+		Instance: &instancepb.Instance{
 			Config:      "emulator-config",
 			DisplayName: "Test Instance",
 			NodeCount:   1,
@@ -135,10 +143,10 @@ func (b *spannerTest) NewDatabase(t testing.TB) string {
 func (b *spannerTest) NewDatastore(t testing.TB, initFunc InitFunc) datastore.Datastore {
 	db := b.NewDatabase(t)
 
-	migrationDriver, err := migrations.NewSpannerDriver(db, "", os.Getenv("SPANNER_EMULATOR_HOST"))
+	migrationDriver, err := migrations.NewSpannerDriver(context.Background(), db, "", os.Getenv("SPANNER_EMULATOR_HOST"))
 	require.NoError(t, err)
 
-	err = migrations.SpannerMigrations.Run(context.Background(), migrationDriver, migrate.Head, migrate.LiveRun)
+	err = migrations.SpannerMigrations.Run(context.Background(), migrationDriver, b.targetMigration, migrate.LiveRun)
 	require.NoError(t, err)
 
 	return initFunc("spanner", db)

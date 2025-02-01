@@ -5,11 +5,11 @@ package integrationtesting_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
-	"github.com/jzelinskie/stringz"
 	"github.com/stretchr/testify/require"
 
 	"github.com/authzed/spicedb/internal/datastore/spanner"
@@ -47,15 +47,15 @@ func TestDispatchIntegration(t *testing.T) {
 					Updates: []*v1.RelationshipUpdate{
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:foo#viewer@user:tom")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:foo#viewer@user:tom")),
 						},
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:foo#parent@resource:bar")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:foo#parent@resource:bar")),
 						},
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:bar#viewer@user:jill")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:bar#viewer@user:jill")),
 						},
 					},
 				})
@@ -120,7 +120,7 @@ func TestDispatchIntegration(t *testing.T) {
 					Updates: []*v1.RelationshipUpdate{
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:foo#parent@someothertype:bar")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:foo#parent@someothertype:bar")),
 						},
 					},
 				})
@@ -161,7 +161,7 @@ func TestDispatchIntegration(t *testing.T) {
 					Updates: []*v1.RelationshipUpdate{
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:foo#viewer@user:someuser")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:foo#viewer@user:someuser")),
 						},
 					},
 				})
@@ -225,7 +225,7 @@ func TestDispatchIntegration(t *testing.T) {
 					Updates: []*v1.RelationshipUpdate{
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:someresource#viewer@user:someuser")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:someresource#viewer@user:someuser")),
 						},
 					},
 				})
@@ -259,7 +259,7 @@ func TestDispatchIntegration(t *testing.T) {
 					Updates: []*v1.RelationshipUpdate{
 						{
 							Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-							Relationship: tuple.MustToRelationship(tuple.MustParse("resource:someresource#viewer@user:sarah")),
+							Relationship: tuple.ToV1Relationship(tuple.MustParse("resource:someresource#viewer@user:sarah")),
 						},
 					},
 				})
@@ -315,7 +315,7 @@ func TestDispatchIntegration(t *testing.T) {
 	}
 
 	for _, engine := range datastore.Engines {
-		if stringz.SliceContains(blacklist, engine) {
+		if slices.Contains(blacklist, engine) {
 			continue
 		}
 		b := testdatastore.RunDatastoreEngine(t, engine)
@@ -325,7 +325,9 @@ func TestDispatchIntegration(t *testing.T) {
 					ds := b.NewDatastore(t, config.DatastoreConfigInitFunc(t,
 						dsconfig.WithWatchBufferLength(0),
 						dsconfig.WithGCWindow(time.Duration(90_000_000_000_000)),
-						dsconfig.WithRevisionQuantization(10)))
+						dsconfig.WithRevisionQuantization(10),
+						dsconfig.WithMaxRetries(50),
+						dsconfig.WithRequestHedgingEnabled(false)))
 
 					conns, cleanup := testserver.TestClusterWithDispatch(t, 1, ds)
 					t.Cleanup(cleanup)

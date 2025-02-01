@@ -7,31 +7,39 @@ import (
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
-	"github.com/jackc/pgtype"
 
 	"github.com/authzed/spicedb/internal/datastore/common"
-	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/datastore"
 )
 
 var (
 	_ common.GarbageCollector = (*pgDatastore)(nil)
 
-	relationTuplePKCols = []string{
-		colNamespace,
-		colObjectID,
-		colRelation,
-		colUsersetNamespace,
-		colUsersetObjectID,
-		colUsersetRelation,
-		colCreatedXid,
-		colDeletedXid,
-	}
-
-	namespacePKCols = []string{colNamespace, colCreatedXid, colDeletedXid}
-
-	transactionPKCols = []string{colXID}
+	// we are using "tableoid" to globally identify the row through the "ctid" in partitioned environments
+	// as it's not guaranteed 2 rows in different partitions have different "ctid" values
+	// See https://www.postgresql.org/docs/current/ddl-system-columns.html#DDL-SYSTEM-COLUMNS-TABLEOID
+	gcPKCols = []string{"tableoid", "ctid"}
 )
+
+func (pgd *pgDatastore) LockForGCRun(ctx context.Context) (bool, error) {
+	return pgd.tryAcquireLock(ctx, gcRunLock)
+}
+
+func (pgd *pgDatastore) UnlockAfterGCRun() error {
+	return pgd.releaseLock(context.Background(), gcRunLock)
+}
+
+func (pgd *pgDatastore) HasGCRun() bool {
+	return pgd.gcHasRun.Load()
+}
+
+func (pgd *pgDatastore) MarkGCCompleted() {
+	pgd.gcHasRun.Store(true)
+}
+
+func (pgd *pgDatastore) ResetGCCompleted() {
+	pgd.gcHasRun.Store(false)
+}
 
 func (pgd *pgDatastore) Now(ctx context.Context) (time.Time, error) {
 	// Retrieve the `now` time from the database.
@@ -41,7 +49,7 @@ func (pgd *pgDatastore) Now(ctx context.Context) (time.Time, error) {
 	}
 
 	var now time.Time
-	err = pgd.dbpool.QueryRow(ctx, nowSQL, nowArgs...).Scan(&now)
+	err = pgd.readPool.QueryRow(ctx, nowSQL, nowArgs...).Scan(&now)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -58,37 +66,49 @@ func (pgd *pgDatastore) TxIDBefore(ctx context.Context, before time.Time) (datas
 		return datastore.NoRevision, err
 	}
 
-	var value, xmin xid8
-	err = pgd.dbpool.QueryRow(ctx, sql, args...).Scan(&value, &xmin)
+	var value xid8
+	var snapshot pgSnapshot
+	err = pgd.readPool.QueryRow(ctx, sql, args...).Scan(&value, &snapshot)
 	if err != nil {
 		return datastore.NoRevision, err
 	}
 
-	if value.Status != pgtype.Present {
-		log.Ctx(ctx).Debug().Time("before", before).Msg("no stale transactions found in the datastore")
-		return datastore.NoRevision, err
-	}
-
-	return postgresRevision{value, xmin}, nil
+	return postgresRevision{snapshot: snapshot, optionalTxID: value}, nil
 }
 
-func (pgd *pgDatastore) DeleteBeforeTx(ctx context.Context, txID datastore.Revision) (removed common.DeletionCounts, err error) {
-	revision := txID.(postgresRevision)
-
-	minTxAlive := revision.tx
-	if revision.xmin.Status == pgtype.Present {
-		minTxAlive = revision.xmin
+func (pgd *pgDatastore) DeleteExpiredRels(ctx context.Context) (int64, error) {
+	if pgd.schema.ExpirationDisabled {
+		return 0, nil
 	}
 
+	now, err := pgd.Now(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return pgd.batchDelete(
+		ctx,
+		tableTuple,
+		gcPKCols,
+		sq.Lt{colExpiration: now.Add(-1 * pgd.gcWindow)},
+	)
+}
+
+func (pgd *pgDatastore) DeleteBeforeTx(ctx context.Context, txID datastore.Revision) (common.DeletionCounts, error) {
+	revision := txID.(postgresRevision)
+
+	minTxAlive := newXid8(revision.snapshot.xmin)
+	removed := common.DeletionCounts{}
+	var err error
 	// Delete any relationship rows that were already dead when this transaction started
 	removed.Relationships, err = pgd.batchDelete(
 		ctx,
 		tableTuple,
-		relationTuplePKCols,
+		gcPKCols,
 		sq.Lt{colDeletedXid: minTxAlive},
 	)
 	if err != nil {
-		return
+		return removed, fmt.Errorf("failed to GC relationships table: %w", err)
 	}
 
 	// Delete all transaction rows with ID < the transaction ID.
@@ -98,25 +118,25 @@ func (pgd *pgDatastore) DeleteBeforeTx(ctx context.Context, txID datastore.Revis
 	removed.Transactions, err = pgd.batchDelete(
 		ctx,
 		tableTransaction,
-		transactionPKCols,
-		sq.Lt{colXID: revision.tx},
+		gcPKCols,
+		sq.Lt{colXID: minTxAlive},
 	)
 	if err != nil {
-		return
+		return removed, fmt.Errorf("failed to GC transactions table: %w", err)
 	}
 
 	// Delete any namespace rows with deleted_transaction <= the transaction ID.
 	removed.Namespaces, err = pgd.batchDelete(
 		ctx,
 		tableNamespace,
-		namespacePKCols,
+		gcPKCols,
 		sq.Lt{colDeletedXid: minTxAlive},
 	)
 	if err != nil {
-		return
+		return removed, fmt.Errorf("failed to GC namespaces table: %w", err)
 	}
 
-	return
+	return removed, err
 }
 
 func (pgd *pgDatastore) batchDelete(
@@ -125,13 +145,12 @@ func (pgd *pgDatastore) batchDelete(
 	pkCols []string,
 	filter sqlFilter,
 ) (int64, error) {
-	sql, args, err := psql.Select(pkCols...).From(tableName).Where(filter).Limit(batchDeleteSize).ToSql()
+	sql, args, err := psql.Select(pkCols...).From(tableName).Where(filter).Limit(gcBatchDeleteSize).ToSql()
 	if err != nil {
 		return -1, err
 	}
 
 	pkColsExpression := strings.Join(pkCols, ", ")
-
 	query := fmt.Sprintf(`WITH rows AS (%[1]s)
 		  DELETE FROM %[2]s
 		  WHERE (%[3]s) IN (SELECT %[3]s FROM rows);
@@ -139,14 +158,14 @@ func (pgd *pgDatastore) batchDelete(
 
 	var deletedCount int64
 	for {
-		cr, err := pgd.dbpool.Exec(ctx, query, args...)
+		cr, err := pgd.writePool.Exec(ctx, query, args...)
 		if err != nil {
 			return deletedCount, err
 		}
 
 		rowsDeleted := cr.RowsAffected()
 		deletedCount += rowsDeleted
-		if rowsDeleted < batchDeleteSize {
+		if rowsDeleted < gcBatchDeleteSize {
 			break
 		}
 	}

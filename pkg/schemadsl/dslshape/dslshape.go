@@ -11,12 +11,13 @@ const (
 	NodeTypeError   NodeType = iota // error occurred; value is text of error
 	NodeTypeFile                    // The file root node
 	NodeTypeComment                 // A single or multiline comment
+	NodeTypeUseFlag                 // A use flag
 
 	NodeTypeDefinition       // A definition.
 	NodeTypeCaveatDefinition // A caveat definition.
 
-	NodeTypeCaveatParameter // A caveat parameter.
-	NodeTypeCaveatExpession // A caveat expression.
+	NodeTypeCaveatParameter  // A caveat parameter.
+	NodeTypeCaveatExpression // A caveat expression.
 
 	NodeTypeRelation   // A relation
 	NodeTypePermission // A permission
@@ -24,6 +25,7 @@ const (
 	NodeTypeTypeReference         // A type reference
 	NodeTypeSpecificTypeReference // A reference to a specific type.
 	NodeTypeCaveatReference       // A caveat reference under a type.
+	NodeTypeTraitReference        // A trait reference under a typr.
 
 	NodeTypeUnionExpression
 	NodeTypeIntersectExpression
@@ -72,6 +74,13 @@ const (
 	NodeCommentPredicateValue = "comment-value"
 
 	//
+	// NodeTypeUseFlag
+	//
+
+	// The name of the use flag.
+	NodeUseFlagPredicateName = "use-flag-name"
+
+	//
 	// NodeTypeDefinition
 	//
 
@@ -92,7 +101,7 @@ const (
 	NodeCaveatDefinitionPredicateExpession = "caveat-definition-expression"
 
 	//
-	// NodeTypeCaveatExpession
+	// NodeTypeCaveatExpression
 	//
 
 	// The raw CEL expression, in string form.
@@ -155,6 +164,9 @@ const (
 	// A caveat under a type reference.
 	NodeSpecificReferencePredicateCaveat = "caveat"
 
+	// A trait under a type reference.
+	NodeSpecificReferencePredicateTrait = "trait"
+
 	//
 	// NodeTypeCaveatReference
 	//
@@ -163,11 +175,25 @@ const (
 	NodeCaveatPredicateCaveat = "caveat-name"
 
 	//
+	// NodeTypeTraitReference
+	//
+
+	// The trait name under the trait.
+	NodeTraitPredicateTrait = "trait-name"
+
+	//
 	// NodeTypePermission
 	//
 
 	// The expression to compute the permission.
 	NodePermissionPredicateComputeExpression = "compute-expression"
+
+	//
+	// NodeTypeArrowExpression
+	//
+
+	// The name of the function in the arrow expression.
+	NodeArrowExpressionFunctionName = "function-name"
 
 	//
 	// NodeTypeIdentifer

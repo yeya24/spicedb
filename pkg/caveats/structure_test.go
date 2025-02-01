@@ -4,9 +4,8 @@ import (
 	"sort"
 	"testing"
 
-	"golang.org/x/exp/maps"
-
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/maps"
 
 	"github.com/authzed/spicedb/pkg/caveats/types"
 )
@@ -38,7 +37,7 @@ func TestReferencedParameters(t *testing.T) {
 		},
 		{
 			MustEnvForVariables(map[string]types.VariableType{
-				"a": types.MapType(types.StringType),
+				"a": types.MustMapType(types.StringType),
 				"b": types.StringType,
 			}),
 			"a[b] == 'hi'",
@@ -58,7 +57,7 @@ func TestReferencedParameters(t *testing.T) {
 		},
 		{
 			MustEnvForVariables(map[string]types.VariableType{
-				"somemap": types.MapType(types.StringType),
+				"somemap": types.MustMapType(types.StringType),
 			}),
 			`somemap.foo == 'hi'`,
 			[]string{
@@ -67,7 +66,7 @@ func TestReferencedParameters(t *testing.T) {
 		},
 		{
 			MustEnvForVariables(map[string]types.VariableType{
-				"tweets":    types.ListType(types.MapType(types.IntType)),
+				"tweets":    types.MustListType(types.MustMapType(types.IntType)),
 				"something": types.IntType,
 			}),
 			`tweets.all(t, t.size <= 140 && something > 42)`,
@@ -78,7 +77,7 @@ func TestReferencedParameters(t *testing.T) {
 		},
 		{
 			MustEnvForVariables(map[string]types.VariableType{
-				"tweets":    types.ListType(types.MapType(types.IntType)),
+				"tweets":    types.MustListType(types.MustMapType(types.IntType)),
 				"something": types.IntType,
 			}),
 			`tweets.all(t, t.size <= 140)`,
@@ -89,15 +88,19 @@ func TestReferencedParameters(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(tc.expr, func(t *testing.T) {
 			compiled, err := compileCaveat(tc.env, tc.expr)
 			require.NoError(t, err)
 
 			sort.Strings(tc.referencedParamNames)
 
-			found := compiled.ReferencedParameters(maps.Keys(tc.env.variables)).AsSlice()
-			sort.Strings(found)
-			require.Equal(t, tc.referencedParamNames, found)
+			found, err := compiled.ReferencedParameters(maps.Keys(tc.env.variables))
+			require.NoError(t, err)
+
+			foundSlice := found.AsSlice()
+			sort.Strings(foundSlice)
+			require.Equal(t, tc.referencedParamNames, foundSlice)
 		})
 	}
 }

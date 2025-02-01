@@ -2,7 +2,6 @@ package v1
 
 import (
 	"context"
-	"fmt"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	grpcvalidate "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/validator"
@@ -10,26 +9,34 @@ import (
 	"google.golang.org/grpc/status"
 
 	log "github.com/authzed/spicedb/internal/logging"
-	"github.com/authzed/spicedb/internal/middleware/consistency"
+	"github.com/authzed/spicedb/internal/middleware"
 	datastoremw "github.com/authzed/spicedb/internal/middleware/datastore"
 	"github.com/authzed/spicedb/internal/middleware/usagemetrics"
 	"github.com/authzed/spicedb/internal/services/shared"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/genutil"
 	dispatchv1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/compiler"
 	"github.com/authzed/spicedb/pkg/schemadsl/generator"
 	"github.com/authzed/spicedb/pkg/schemadsl/input"
+	"github.com/authzed/spicedb/pkg/zedtoken"
 )
 
 // NewSchemaServer creates a SchemaServiceServer instance.
-func NewSchemaServer(additiveOnly, caveatsEnabled bool) v1.SchemaServiceServer {
+func NewSchemaServer(additiveOnly bool, expiringRelsEnabled bool) v1.SchemaServiceServer {
 	return &schemaServer{
 		WithServiceSpecificInterceptors: shared.WithServiceSpecificInterceptors{
-			Unary:  grpcvalidate.UnaryServerInterceptor(true),
-			Stream: grpcvalidate.StreamServerInterceptor(true),
+			Unary: middleware.ChainUnaryServer(
+				grpcvalidate.UnaryServerInterceptor(),
+				usagemetrics.UnaryServerInterceptor(),
+			),
+			Stream: middleware.ChainStreamServer(
+				grpcvalidate.StreamServerInterceptor(),
+				usagemetrics.StreamServerInterceptor(),
+			),
 		},
-		additiveOnly:   additiveOnly,
-		caveatsEnabled: caveatsEnabled,
+		additiveOnly:        additiveOnly,
+		expiringRelsEnabled: expiringRelsEnabled,
 	}
 }
 
@@ -37,22 +44,32 @@ type schemaServer struct {
 	v1.UnimplementedSchemaServiceServer
 	shared.WithServiceSpecificInterceptors
 
-	additiveOnly   bool
-	caveatsEnabled bool
+	additiveOnly        bool
+	expiringRelsEnabled bool
 }
 
-func (ss *schemaServer) ReadSchema(ctx context.Context, in *v1.ReadSchemaRequest) (*v1.ReadSchemaResponse, error) {
-	readRevision, _ := consistency.MustRevisionFromContext(ctx)
-	ds := datastoremw.MustFromContext(ctx).SnapshotReader(readRevision)
+func (ss *schemaServer) rewriteError(ctx context.Context, err error) error {
+	return shared.RewriteError(ctx, err, nil)
+}
 
-	nsDefs, err := ds.ListNamespaces(ctx)
+func (ss *schemaServer) ReadSchema(ctx context.Context, _ *v1.ReadSchemaRequest) (*v1.ReadSchemaResponse, error) {
+	// Schema is always read from the head revision.
+	ds := datastoremw.MustFromContext(ctx)
+	headRevision, err := ds.HeadRevision(ctx)
 	if err != nil {
-		return nil, rewriteError(ctx, err)
+		return nil, ss.rewriteError(ctx, err)
 	}
 
-	caveatDefs, err := ds.ListCaveats(ctx)
+	reader := ds.SnapshotReader(headRevision)
+
+	nsDefs, err := reader.ListAllNamespaces(ctx)
 	if err != nil {
-		return nil, rewriteError(ctx, err)
+		return nil, ss.rewriteError(ctx, err)
+	}
+
+	caveatDefs, err := reader.ListAllCaveats(ctx)
+	if err != nil {
+		return nil, ss.rewriteError(ctx, err)
 	}
 
 	if len(nsDefs) == 0 {
@@ -61,21 +78,30 @@ func (ss *schemaServer) ReadSchema(ctx context.Context, in *v1.ReadSchemaRequest
 
 	schemaDefinitions := make([]compiler.SchemaDefinition, 0, len(nsDefs)+len(caveatDefs))
 	for _, caveatDef := range caveatDefs {
-		schemaDefinitions = append(schemaDefinitions, caveatDef)
+		schemaDefinitions = append(schemaDefinitions, caveatDef.Definition)
 	}
 
 	for _, nsDef := range nsDefs {
-		schemaDefinitions = append(schemaDefinitions, nsDef)
+		schemaDefinitions = append(schemaDefinitions, nsDef.Definition)
 	}
 
-	schemaText, _ := generator.GenerateSchema(schemaDefinitions)
+	schemaText, _, err := generator.GenerateSchema(schemaDefinitions)
+	if err != nil {
+		return nil, ss.rewriteError(ctx, err)
+	}
+
+	dispatchCount, err := genutil.EnsureUInt32(len(nsDefs) + len(caveatDefs))
+	if err != nil {
+		return nil, ss.rewriteError(ctx, err)
+	}
 
 	usagemetrics.SetInContext(ctx, &dispatchv1.ResponseMeta{
-		DispatchCount: uint32(len(nsDefs) + len(caveatDefs)),
+		DispatchCount: dispatchCount,
 	})
 
 	return &v1.ReadSchemaResponse{
 		SchemaText: schemaText,
+		ReadAt:     zedtoken.MustNewFromRevision(headRevision),
 	}, nil
 }
 
@@ -85,40 +111,48 @@ func (ss *schemaServer) WriteSchema(ctx context.Context, in *v1.WriteSchemaReque
 	ds := datastoremw.MustFromContext(ctx)
 
 	// Compile the schema into the namespace definitions.
-	emptyDefaultPrefix := ""
+	opts := []compiler.Option{}
+	if !ss.expiringRelsEnabled {
+		opts = append(opts, compiler.DisallowExpirationFlag())
+	}
+
 	compiled, err := compiler.Compile(compiler.InputSchema{
 		Source:       input.Source("schema"),
 		SchemaString: in.GetSchema(),
-	}, &emptyDefaultPrefix)
+	}, compiler.AllowUnprefixedObjectType(), opts...)
 	if err != nil {
-		return nil, rewriteError(ctx, err)
+		return nil, ss.rewriteError(ctx, err)
 	}
 	log.Ctx(ctx).Trace().Int("objectDefinitions", len(compiled.ObjectDefinitions)).Int("caveatDefinitions", len(compiled.CaveatDefinitions)).Msg("compiled namespace definitions")
-
-	if !ss.caveatsEnabled && len(compiled.CaveatDefinitions) > 0 {
-		return nil, fmt.Errorf("caveats are currently not supported")
-	}
 
 	// Do as much validation as we can before talking to the datastore.
 	validated, err := shared.ValidateSchemaChanges(ctx, compiled, ss.additiveOnly)
 	if err != nil {
-		return nil, rewriteError(ctx, err)
+		return nil, ss.rewriteError(ctx, err)
 	}
 
 	// Update the schema.
-	_, err = ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	revision, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		applied, err := shared.ApplySchemaChanges(ctx, rwt, validated)
 		if err != nil {
 			return err
 		}
+
+		dispatchCount, err := genutil.EnsureUInt32(applied.TotalOperationCount)
+		if err != nil {
+			return err
+		}
+
 		usagemetrics.SetInContext(ctx, &dispatchv1.ResponseMeta{
-			DispatchCount: applied.TotalOperationCount,
+			DispatchCount: dispatchCount,
 		})
 		return nil
 	})
 	if err != nil {
-		return nil, rewriteError(ctx, err)
+		return nil, ss.rewriteError(ctx, err)
 	}
 
-	return &v1.WriteSchemaResponse{}, nil
+	return &v1.WriteSchemaResponse{
+		WrittenAt: zedtoken.MustNewFromRevision(revision),
+	}, nil
 }

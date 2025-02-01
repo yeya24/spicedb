@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
@@ -40,14 +41,24 @@ func TestSubjectByTypeSet(t *testing.T) {
 	require.True(t, set.IsEmpty())
 
 	// Add some concrete subjects.
-	set.AddConcreteSubject(tuple.ParseONR("document:foo#viewer"))
-	set.AddConcreteSubject(tuple.ParseONR("document:bar#viewer"))
-	set.AddConcreteSubject(tuple.ParseONR("team:something#member"))
-	set.AddConcreteSubject(tuple.ParseONR("team:other#member"))
-	set.AddConcreteSubject(tuple.ParseONR("team:other#manager"))
+	err := set.AddConcreteSubject(tuple.MustParseONR("document:foo#viewer"))
+	require.NoError(t, err)
+
+	err = set.AddConcreteSubject(tuple.MustParseONR("document:bar#viewer"))
+	require.NoError(t, err)
+
+	err = set.AddConcreteSubject(tuple.MustParseONR("team:something#member"))
+	require.NoError(t, err)
+
+	err = set.AddConcreteSubject(tuple.MustParseONR("team:other#member"))
+	require.NoError(t, err)
+
+	err = set.AddConcreteSubject(tuple.MustParseONR("team:other#manager"))
+	require.NoError(t, err)
 
 	// Add a caveated subject.
-	set.AddSubjectOf(tuple.WithCaveat(tuple.MustParse("document:foo#viewer@user:tom"), "first"))
+	err = set.AddSubjectOf(tuple.MustWithCaveat(tuple.MustParse("document:foo#viewer@user:tom"), "first"))
+	require.NoError(t, err)
 
 	require.False(t, set.IsEmpty())
 
@@ -77,7 +88,8 @@ func TestSubjectSetByTypeWithCaveats(t *testing.T) {
 	set := NewSubjectByTypeSet()
 	require.True(t, set.IsEmpty())
 
-	set.AddSubjectOf(tuple.WithCaveat(tuple.MustParse("document:foo#viewer@user:tom"), "first"))
+	err := set.AddSubjectOf(tuple.MustWithCaveat(tuple.MustParse("document:foo#viewer@user:tom"), "first"))
+	require.NoError(t, err)
 
 	ss, ok := set.SubjectSetForType(&core.RelationReference{
 		Namespace: "user",
@@ -92,4 +104,30 @@ func TestSubjectSetByTypeWithCaveats(t *testing.T) {
 		caveatexpr("first"),
 		tom.GetCaveatExpression(),
 	)
+}
+
+func TestSubjectSetMapOverSameSubjectDifferentRelation(t *testing.T) {
+	set := NewSubjectByTypeSet()
+	require.True(t, set.IsEmpty())
+
+	err := set.AddSubjectOf(tuple.MustParse("document:foo#folder@folder:folder1"))
+	require.NoError(t, err)
+
+	err = set.AddSubjectOf(tuple.MustParse("document:foo#folder@folder:folder2#parent"))
+	require.NoError(t, err)
+
+	mapped, err := set.Map(func(rr *core.RelationReference) (*core.RelationReference, error) {
+		return &core.RelationReference{
+			Namespace: rr.Namespace,
+			Relation:  "shared",
+		}, nil
+	})
+	require.NoError(t, err)
+
+	foundSubjectIDs := mapz.NewSet[string]()
+	for _, sub := range mapped.byType["folder#shared"].AsSlice() {
+		foundSubjectIDs.Add(sub.SubjectId)
+	}
+
+	require.ElementsMatch(t, []string{"folder1", "folder2"}, foundSubjectIDs.AsSlice())
 }

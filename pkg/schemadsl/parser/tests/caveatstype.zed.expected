@@ -26,7 +26,7 @@ NodeTypeFile
                   start-rune = 41
                   type-name = user
                 NodeTypeSpecificTypeReference
-                  end-rune = 51
+                  end-rune = 67
                   input-source = caveats type test
                   start-rune = 48
                   type-name = user
@@ -35,9 +35,9 @@ NodeTypeFile
                       caveat-name = somecaveat
                       end-rune = 67
                       input-source = caveats type test
-                      start-rune = 53
+                      start-rune = 58
                 NodeTypeSpecificTypeReference
-                  end-rune = 81
+                  end-rune = 100
                   input-source = caveats type test
                   relation-name = member
                   start-rune = 71
@@ -47,7 +47,7 @@ NodeTypeFile
                       caveat-name = anothercaveat
                       end-rune = 100
                       input-source = caveats type test
-                      start-rune = 83
+                      start-rune = 88
         NodeTypeRelation
           end-rune = 187
           input-source = caveats type test
@@ -65,7 +65,7 @@ NodeTypeFile
                   start-rune = 121
                   type-name = user
                 NodeTypeSpecificTypeReference
-                  end-rune = 133
+                  end-rune = 153
                   input-source = caveats type test
                   start-rune = 128
                   type-name = user
@@ -75,9 +75,9 @@ NodeTypeFile
                       caveat-name = wildcardcaveat
                       end-rune = 153
                       input-source = caveats type test
-                      start-rune = 135
+                      start-rune = 140
                 NodeTypeSpecificTypeReference
-                  end-rune = 160
+                  end-rune = 187
                   input-source = caveats type test
                   start-rune = 157
                   type-name = user
@@ -86,4 +86,4 @@ NodeTypeFile
                       caveat-name = someprefix/somecaveat
                       end-rune = 187
                       input-source = caveats type test
-                      start-rune = 162
+                      start-rune = 167

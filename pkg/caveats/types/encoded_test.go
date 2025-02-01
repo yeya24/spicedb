@@ -18,16 +18,16 @@ func TestEncodeDecodeTypes(t *testing.T) {
 			vtype: IntType,
 		},
 		{
-			vtype: ListType(IntType),
+			vtype: MustListType(IntType),
 		},
 		{
-			vtype: ListType(StringType),
+			vtype: MustListType(StringType),
 		},
 		{
-			vtype: MapType(AnyType),
+			vtype: MustMapType(AnyType),
 		},
 		{
-			vtype: MapType(UIntType),
+			vtype: MustMapType(UIntType),
 		},
 		{
 			vtype: IPAddressType,
@@ -45,6 +45,7 @@ func TestEncodeDecodeTypes(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(tc.vtype.String(), func(t *testing.T) {
 			encoded := EncodeParameterType(tc.vtype)
 			decoded, err := DecodeParameterType(encoded)

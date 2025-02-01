@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/authzed/cel-go/cel"
 	"golang.org/x/exp/maps"
-
-	"github.com/google/cel-go/cel"
 )
 
 // VariableType defines the supported types of variables in caveats.
@@ -29,7 +28,7 @@ func (vt VariableType) String() string {
 			childTypeStrings = append(childTypeStrings, childType.String())
 		}
 
-		return fmt.Sprintf("%s<%s>", vt.localName, strings.Join(childTypeStrings, ", "))
+		return vt.localName + "<" + strings.Join(childTypeStrings, ", ") + ">"
 	}
 
 	return vt.localName

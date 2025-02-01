@@ -6,8 +6,8 @@ import (
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 
-	"github.com/authzed/spicedb/internal/datastore/options"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
 )
 
 var limitOne uint64 = 1
@@ -20,25 +20,28 @@ func checkPreconditions(
 	preconditions []*v1.Precondition,
 ) error {
 	for _, precond := range preconditions {
-		iter, err := rwt.QueryRelationships(ctx, datastore.RelationshipsFilterFromPublicFilter(precond.Filter), options.WithLimit(&limitOne))
+		dsFilter, err := datastore.RelationshipsFilterFromPublicFilter(precond.Filter)
+		if err != nil {
+			return fmt.Errorf("error converting filter: %w", err)
+		}
+
+		iter, err := rwt.QueryRelationships(ctx, dsFilter, options.WithLimit(&limitOne))
 		if err != nil {
 			return fmt.Errorf("error reading relationships: %w", err)
 		}
-		defer iter.Close()
 
-		first := iter.Next()
-
-		if first == nil && iter.Err() != nil {
+		_, ok, err := datastore.FirstRelationshipIn(iter)
+		if err != nil {
 			return fmt.Errorf("error reading relationships from iterator: %w", err)
 		}
 
 		switch precond.Operation {
 		case v1.Precondition_OPERATION_MUST_NOT_MATCH:
-			if first != nil {
+			if ok {
 				return NewPreconditionFailedErr(precond)
 			}
 		case v1.Precondition_OPERATION_MUST_MATCH:
-			if first == nil {
+			if !ok {
 				return NewPreconditionFailedErr(precond)
 			}
 		default:

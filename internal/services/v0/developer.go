@@ -35,7 +35,7 @@ func NewDeveloperServer(store ShareStore) v0.DeveloperServiceServer {
 	}
 }
 
-func (ds *devServer) UpgradeSchema(ctx context.Context, req *v0.UpgradeSchemaRequest) (*v0.UpgradeSchemaResponse, error) {
+func (ds *devServer) UpgradeSchema(_ context.Context, req *v0.UpgradeSchemaRequest) (*v0.UpgradeSchemaResponse, error) {
 	upgraded, err := upgradeSchema(req.NamespaceConfigs)
 	if err != nil {
 		return &v0.UpgradeSchemaResponse{
@@ -50,7 +50,7 @@ func (ds *devServer) UpgradeSchema(ctx context.Context, req *v0.UpgradeSchemaReq
 	}, nil
 }
 
-func (ds *devServer) Share(ctx context.Context, req *v0.ShareRequest) (*v0.ShareResponse, error) {
+func (ds *devServer) Share(_ context.Context, req *v0.ShareRequest) (*v0.ShareResponse, error) {
 	reference, err := ds.shareStore.StoreShared(SharedDataV2{
 		Version:           sharedDataVersion,
 		Schema:            req.Schema,
@@ -102,16 +102,16 @@ func (ds *devServer) LookupShared(ctx context.Context, req *v0.LookupShareReques
 	}, nil
 }
 
-func (ds *devServer) EditCheck(ctx context.Context, req *v0.EditCheckRequest) (*v0.EditCheckResponse, error) {
-	panic("No longer implemented. Please use the WebAssembly development pacakge")
+func (ds *devServer) EditCheck(_ context.Context, _ *v0.EditCheckRequest) (*v0.EditCheckResponse, error) {
+	return nil, fmt.Errorf("no longer implemented. Please use the WebAssembly development package")
 }
 
-func (ds *devServer) Validate(ctx context.Context, req *v0.ValidateRequest) (*v0.ValidateResponse, error) {
-	panic("No longer implemented. Please use the WebAssembly development pacakge")
+func (ds *devServer) Validate(_ context.Context, _ *v0.ValidateRequest) (*v0.ValidateResponse, error) {
+	return nil, fmt.Errorf("no longer implemented. Please use the WebAssembly development package")
 }
 
-func (ds *devServer) FormatSchema(ctx context.Context, req *v0.FormatSchemaRequest) (*v0.FormatSchemaResponse, error) {
-	panic("No longer implemented. Please use the WebAssembly development pacakge")
+func (ds *devServer) FormatSchema(_ context.Context, _ *v0.FormatSchemaRequest) (*v0.FormatSchemaResponse, error) {
+	return nil, fmt.Errorf("no longer implemented. Please use the WebAssembly development package")
 }
 
 func upgradeSchema(configs []string) (string, error) {
@@ -123,7 +123,11 @@ func upgradeSchema(configs []string) (string, error) {
 			return "", fmt.Errorf("could not upgrade schema due to parse error: %w", nerr)
 		}
 
-		generated, _ := generator.GenerateSource(&nsDef)
+		generated, _, err := generator.GenerateSource(&nsDef)
+		if err != nil {
+			return "", err
+		}
+
 		schema += generated
 		schema += "\n\n"
 	}

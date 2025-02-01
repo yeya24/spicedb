@@ -1,46 +1,44 @@
 package developmentmembership
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 
 	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 // NewFoundSubject creates a new FoundSubject for a subject and a set of its resources.
-func NewFoundSubject(subject *core.ObjectAndRelation, resources ...*core.ObjectAndRelation) FoundSubject {
-	return FoundSubject{subject, nil, nil, tuple.NewONRSet(resources...)}
+func NewFoundSubject(subject *core.DirectSubject, resources ...tuple.ObjectAndRelation) FoundSubject {
+	return FoundSubject{tuple.FromCoreObjectAndRelation(subject.Subject), nil, subject.CaveatExpression, NewONRSet(resources...)}
 }
 
 // FoundSubject contains a single found subject and all the relationships in which that subject
 // is a member which were found via the ONRs expansion.
 type FoundSubject struct {
 	// subject is the subject found.
-	subject *core.ObjectAndRelation
+	subject tuple.ObjectAndRelation
 
 	// excludedSubjects are any subjects excluded. Only should be set if subject is a wildcard.
 	excludedSubjects []FoundSubject
 
 	// caveatExpression is the conditional expression on the found subject.
-	caveatExpression *v1.CaveatExpression
+	caveatExpression *core.CaveatExpression
 
-	// relations are the relations under which the subject lives that informed the locating
+	// resources are the resources under which the subject lives that informed the locating
 	// of this subject for the root ONR.
-	relationships *tuple.ONRSet
+	resources ONRSet
 }
 
 // GetSubjectId is named to match the Subject interface for the BaseSubjectSet.
 //
 //nolint:all
 func (fs FoundSubject) GetSubjectId() string {
-	return fs.subject.ObjectId
+	return fs.subject.ObjectID
 }
 
-func (fs FoundSubject) GetCaveatExpression() *v1.CaveatExpression {
+func (fs FoundSubject) GetCaveatExpression() *core.CaveatExpression {
 	return fs.caveatExpression
 }
 
@@ -49,14 +47,14 @@ func (fs FoundSubject) GetExcludedSubjects() []FoundSubject {
 }
 
 // Subject returns the Subject of the FoundSubject.
-func (fs FoundSubject) Subject() *core.ObjectAndRelation {
+func (fs FoundSubject) Subject() tuple.ObjectAndRelation {
 	return fs.subject
 }
 
 // WildcardType returns the object type for the wildcard subject, if this is a wildcard subject.
 func (fs FoundSubject) WildcardType() (string, bool) {
-	if fs.subject.ObjectId == tuple.PublicWildcard {
-		return fs.subject.Namespace, true
+	if fs.subject.ObjectID == tuple.PublicWildcard {
+		return fs.subject.ObjectType, true
 	}
 
 	return "", false
@@ -64,70 +62,58 @@ func (fs FoundSubject) WildcardType() (string, bool) {
 
 // ExcludedSubjectsFromWildcard returns those subjects excluded from the wildcard subject.
 // If not a wildcard subject, returns false.
-func (fs FoundSubject) ExcludedSubjectsFromWildcard() ([]*core.ObjectAndRelation, bool) {
-	if fs.subject.ObjectId == tuple.PublicWildcard {
-		excludedSubjects := make([]*core.ObjectAndRelation, 0, len(fs.excludedSubjects))
-		for _, excludedSubject := range fs.excludedSubjects {
-			// TODO(jschorr): Fix once we add caveats support to debug tooling
-			if excludedSubject.caveatExpression != nil {
-				panic("not yet supported")
-			}
-
-			excludedSubjects = append(excludedSubjects, excludedSubject.subject)
-		}
-
-		return excludedSubjects, true
+func (fs FoundSubject) ExcludedSubjectsFromWildcard() ([]FoundSubject, bool) {
+	if fs.subject.ObjectID == tuple.PublicWildcard {
+		return fs.excludedSubjects, true
 	}
 
-	return []*core.ObjectAndRelation{}, false
+	return nil, false
 }
 
-func (fs FoundSubject) excludedSubjectIDs() []string {
-	excludedSubjects := make([]string, 0, len(fs.excludedSubjects))
+func (fs FoundSubject) excludedSubjectStrings() []string {
+	excludedStrings := make([]string, 0, len(fs.excludedSubjects))
 	for _, excludedSubject := range fs.excludedSubjects {
-		// TODO(jschorr): Fix once we add caveats support to debug tooling
-		if excludedSubject.caveatExpression != nil {
-			panic("not yet supported")
+		excludedSubjectString := tuple.StringONR(excludedSubject.subject)
+		if excludedSubject.GetCaveatExpression() != nil {
+			excludedSubjectString += "[...]"
 		}
-
-		excludedSubjects = append(excludedSubjects, excludedSubject.subject.ObjectId)
+		excludedStrings = append(excludedStrings, excludedSubjectString)
 	}
 
-	return excludedSubjects
-}
-
-// Relationships returns all the relationships in which the subject was found as per the expand.
-func (fs FoundSubject) Relationships() []*core.ObjectAndRelation {
-	return fs.relationships.AsSlice()
+	sort.Strings(excludedStrings)
+	return excludedStrings
 }
 
 // ToValidationString returns the FoundSubject in a format that is consumable by the validationfile
 // package.
 func (fs FoundSubject) ToValidationString() string {
+	onrString := tuple.StringONR(fs.Subject())
+	validationString := onrString
 	if fs.caveatExpression != nil {
-		// TODO(jschorr): Implement once we have a format for this.
-		panic("conditional found subjects not yet supported")
+		validationString = validationString + "[...]"
 	}
 
-	onrString := tuple.StringONR(fs.Subject())
 	excluded, isWildcard := fs.ExcludedSubjectsFromWildcard()
 	if isWildcard && len(excluded) > 0 {
-		excludedONRStrings := make([]string, 0, len(excluded))
-		for _, excludedONR := range excluded {
-			excludedONRStrings = append(excludedONRStrings, tuple.StringONR(excludedONR))
-		}
-
-		sort.Strings(excludedONRStrings)
-		return fmt.Sprintf("%s - {%s}", onrString, strings.Join(excludedONRStrings, ", "))
+		validationString = validationString + " - {" + strings.Join(fs.excludedSubjectStrings(), ", ") + "}"
 	}
 
-	return onrString
+	return validationString
+}
+
+func (fs FoundSubject) String() string {
+	return fs.ToValidationString()
+}
+
+// ParentResources returns all the resources in which the subject was found as per the expand.
+func (fs FoundSubject) ParentResources() []tuple.ObjectAndRelation {
+	return fs.resources.AsSlice()
 }
 
 // FoundSubjects contains the subjects found for a specific ONR.
 type FoundSubjects struct {
 	// subjects is a map from the Subject ONR (as a string) to the FoundSubject information.
-	subjects TrackingSubjectSet
+	subjects *TrackingSubjectSet
 }
 
 // ListFound returns a slice of all the FoundSubject's.
@@ -136,6 +122,6 @@ func (fs FoundSubjects) ListFound() []FoundSubject {
 }
 
 // LookupSubject returns the FoundSubject for a matching subject, if any.
-func (fs FoundSubjects) LookupSubject(subject *core.ObjectAndRelation) (FoundSubject, bool) {
+func (fs FoundSubjects) LookupSubject(subject tuple.ObjectAndRelation) (FoundSubject, bool) {
 	return fs.subjects.Get(subject)
 }

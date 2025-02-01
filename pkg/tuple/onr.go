@@ -2,103 +2,74 @@ package tuple
 
 import (
 	"fmt"
-	"sort"
-
-	"github.com/jzelinskie/stringz"
-
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"regexp"
+	"slices"
 )
 
-const (
-	// Format is the serialized form of the tuple
-	formatWithRel            = "%s:%s#%s"
-	formatImplicitSubjectRel = "%s:%s"
+var (
+	onrRegex     = regexp.MustCompile(fmt.Sprintf("^%s$", onrExpr))
+	subjectRegex = regexp.MustCompile(fmt.Sprintf("^%s$", subjectExpr))
 )
 
-// ObjectAndRelation creates an ONR from string pieces.
-func ObjectAndRelation(ns, oid, rel string) *core.ObjectAndRelation {
-	return &core.ObjectAndRelation{
-		Namespace: ns,
-		ObjectId:  oid,
-		Relation:  rel,
-	}
-}
+var (
+	onrSubjectRelIndex   = slices.Index(subjectRegex.SubexpNames(), "subjectRel")
+	onrSubjectTypeIndex  = slices.Index(subjectRegex.SubexpNames(), "subjectType")
+	onrSubjectIDIndex    = slices.Index(subjectRegex.SubexpNames(), "subjectID")
+	onrResourceTypeIndex = slices.Index(onrRegex.SubexpNames(), "resourceType")
+	onrResourceIDIndex   = slices.Index(onrRegex.SubexpNames(), "resourceID")
+	onrResourceRelIndex  = slices.Index(onrRegex.SubexpNames(), "resourceRel")
+)
 
-// RelationReference creates a RelationReference from the string pieces.
-func RelationReference(namespaceName string, relationName string) *core.RelationReference {
-	return &core.RelationReference{
-		Namespace: namespaceName,
-		Relation:  relationName,
-	}
-}
-
-// ParseSubjectONR converts a string representation of a Subject ONR to a proto object. Unlike
+// ParseSubjectONR converts a string representation of a Subject ONR to an ObjectAndRelation. Unlike
 // ParseONR, this method allows for objects without relations. If an object without a relation
 // is given, the relation will be set to ellipsis.
-func ParseSubjectONR(subjectOnr string) *core.ObjectAndRelation {
+func ParseSubjectONR(subjectOnr string) (ObjectAndRelation, error) {
 	groups := subjectRegex.FindStringSubmatch(subjectOnr)
-
 	if len(groups) == 0 {
-		return nil
+		return ObjectAndRelation{}, fmt.Errorf("invalid subject ONR: %s", subjectOnr)
 	}
 
 	relation := Ellipsis
-	subjectRelIndex := stringz.SliceIndex(subjectRegex.SubexpNames(), "subjectRel")
-	if len(groups[subjectRelIndex]) > 0 {
-		relation = groups[subjectRelIndex]
+	if len(groups[onrSubjectRelIndex]) > 0 {
+		relation = groups[onrSubjectRelIndex]
 	}
 
-	return &core.ObjectAndRelation{
-		Namespace: groups[stringz.SliceIndex(subjectRegex.SubexpNames(), "subjectType")],
-		ObjectId:  groups[stringz.SliceIndex(subjectRegex.SubexpNames(), "subjectID")],
-		Relation:  relation,
-	}
+	return ObjectAndRelation{
+		ObjectType: groups[onrSubjectTypeIndex],
+		ObjectID:   groups[onrSubjectIDIndex],
+		Relation:   relation,
+	}, nil
 }
 
-// ParseONR converts a string representation of an ONR to a proto object.
-func ParseONR(onr string) *core.ObjectAndRelation {
+// MustParseSubjectONR converts a string representation of a Subject ONR to an ObjectAndRelation.
+// Panics on error.
+func MustParseSubjectONR(subjectOnr string) ObjectAndRelation {
+	parsed, err := ParseSubjectONR(subjectOnr)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
+
+// ParseONR converts a string representation of an ONR to an ObjectAndRelation object.
+func ParseONR(onr string) (ObjectAndRelation, error) {
 	groups := onrRegex.FindStringSubmatch(onr)
-
 	if len(groups) == 0 {
-		return nil
+		return ObjectAndRelation{}, fmt.Errorf("invalid ONR: %s", onr)
 	}
 
-	return &core.ObjectAndRelation{
-		Namespace: groups[stringz.SliceIndex(onrRegex.SubexpNames(), "resourceType")],
-		ObjectId:  groups[stringz.SliceIndex(onrRegex.SubexpNames(), "resourceID")],
-		Relation:  groups[stringz.SliceIndex(onrRegex.SubexpNames(), "resourceRel")],
-	}
+	return ObjectAndRelation{
+		ObjectType: groups[onrResourceTypeIndex],
+		ObjectID:   groups[onrResourceIDIndex],
+		Relation:   groups[onrResourceRelIndex],
+	}, nil
 }
 
-// StringRR converts a RR object to a string.
-func StringRR(rr *core.RelationReference) string {
-	if rr == nil {
-		return ""
+// MustParseONR converts a string representation of an ONR to an ObjectAndRelation object. Panics on error.
+func MustParseONR(onr string) ObjectAndRelation {
+	parsed, err := ParseONR(onr)
+	if err != nil {
+		panic(err)
 	}
-
-	return fmt.Sprintf("%s#%s", rr.Namespace, rr.Relation)
-}
-
-// StringONR converts an ONR object to a string.
-func StringONR(onr *core.ObjectAndRelation) string {
-	if onr == nil {
-		return ""
-	}
-
-	if onr.Relation == Ellipsis {
-		return fmt.Sprintf(formatImplicitSubjectRel, onr.Namespace, onr.ObjectId)
-	}
-
-	return fmt.Sprintf(formatWithRel, onr.Namespace, onr.ObjectId, onr.Relation)
-}
-
-// StringsONRs converts ONR objects to a string slice, sorted.
-func StringsONRs(onrs []*core.ObjectAndRelation) []string {
-	onrstrings := make([]string, 0, len(onrs))
-	for _, onr := range onrs {
-		onrstrings = append(onrstrings, StringONR(onr))
-	}
-
-	sort.Strings(onrstrings)
-	return onrstrings
+	return parsed
 }

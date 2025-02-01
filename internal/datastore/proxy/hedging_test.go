@@ -8,15 +8,16 @@ import (
 	"time"
 
 	"github.com/benbjohnson/clock"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
+	"github.com/authzed/spicedb/internal/datastore/common"
 	"github.com/authzed/spicedb/internal/datastore/proxy/proxy_test"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
 	"github.com/authzed/spicedb/pkg/datastore"
-	"github.com/authzed/spicedb/pkg/datastore/revision"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 var (
@@ -27,10 +28,10 @@ var (
 	errKnown             = errors.New("known error")
 	errAnotherKnown      = errors.New("another known error")
 	nsKnown              = "namespace_name"
-	revisionKnown        = revision.NewFromDecimal(decimal.NewFromInt(1))
-	anotherRevisionKnown = revision.NewFromDecimal(decimal.NewFromInt(2))
+	revisionKnown        = revisions.NewForTransactionID(1)
+	anotherRevisionKnown = revisions.NewForTransactionID(2)
 
-	emptyIterator = datastore.NewSliceRelationshipIterator(nil)
+	emptyIterator = common.NewSliceRelationshipIterator(nil)
 )
 
 type testFunc func(t *testing.T, proxy datastore.Datastore, expectFirst bool)
@@ -45,14 +46,14 @@ func TestDatastoreRequestHedging(t *testing.T) {
 		f                 testFunc
 	}{
 		{
-			"ReadNamespace",
+			"ReadNamespaceByName",
 			true,
 			[]interface{}{nsKnown},
 			[]interface{}{&core.NamespaceDefinition{}, revisionKnown, errKnown},
 			[]interface{}{&core.NamespaceDefinition{}, anotherRevisionKnown, errKnown},
 			func(t *testing.T, proxy datastore.Datastore, expectFirst bool) {
 				require := require.New(t)
-				_, rev, err := proxy.SnapshotReader(datastore.NoRevision).ReadNamespace(context.Background(), nsKnown)
+				_, rev, err := proxy.SnapshotReader(datastore.NoRevision).ReadNamespaceByName(context.Background(), nsKnown)
 				require.ErrorIs(errKnown, err)
 				if expectFirst {
 					require.Equal(revisionKnown, rev)
@@ -134,13 +135,15 @@ func TestDatastoreRequestHedging(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
+		tc := tc
 		t.Run(tc.methodName, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreTopFunction("github.com/authzed/spicedb/internal/datastore/proxy.autoAdvance.func1"), goleak.IgnoreCurrent())
 			mockTime := clock.NewMock()
 			delegateDS := &proxy_test.MockDatastore{}
-			proxy := newHedgingProxyWithTimeSource(
+			proxy, err := newHedgingProxyWithTimeSource(
 				delegateDS, slowQueryTime, maxSampleCount, quantile, mockTime,
 			)
+			require.NoError(t, err)
 
 			delegate := &delegateDS.Mock
 
@@ -160,7 +163,7 @@ func TestDatastoreRequestHedging(t *testing.T) {
 
 			delegate.
 				On(tc.methodName, tc.arguments...).
-				WaitUntil(mockTime.After(3 * slowQueryTime)).
+				WaitUntil(mockTime.After(5 * slowQueryTime)).
 				Return(tc.firstCallResults...).
 				Once()
 			delegate.
@@ -168,7 +171,7 @@ func TestDatastoreRequestHedging(t *testing.T) {
 				Return(tc.secondCallResults...).
 				Once()
 
-			done := autoAdvance(mockTime, slowQueryTime, 5*slowQueryTime)
+			done := autoAdvance(mockTime, slowQueryTime, 6*slowQueryTime)
 
 			tc.f(t, proxy, false)
 			delegate.AssertExpectations(t)
@@ -177,16 +180,16 @@ func TestDatastoreRequestHedging(t *testing.T) {
 
 			delegate.
 				On(tc.methodName, tc.arguments...).
-				WaitUntil(mockTime.After(3 * slowQueryTime)).
+				WaitUntil(mockTime.After(7 * slowQueryTime)).
 				Return(tc.firstCallResults...).
 				Once()
 			delegate.
 				On(tc.methodName, tc.arguments...).
-				WaitUntil(mockTime.After(4 * slowQueryTime)).
+				WaitUntil(mockTime.After(8 * slowQueryTime)).
 				Return(tc.secondCallResults...).
 				Once()
 
-			autoAdvance(mockTime, slowQueryTime, 8*slowQueryTime)
+			autoAdvance(mockTime, slowQueryTime, 9*slowQueryTime)
 
 			tc.f(t, proxy, true)
 			delegate.AssertExpectations(t)
@@ -261,25 +264,17 @@ func TestBadArgs(t *testing.T) {
 	require := require.New(t)
 	delegate := &proxy_test.MockDatastore{}
 
-	badInitialThreshold := func() {
-		NewHedgingProxy(delegate, -1*time.Millisecond, maxSampleCount, quantile)
-	}
-	require.Panics(badInitialThreshold)
+	_, err := NewHedgingProxy(delegate, -1*time.Millisecond, maxSampleCount, quantile)
+	require.Error(err)
 
-	maxRequestsTooSmall := func() {
-		NewHedgingProxy(delegate, 10*time.Millisecond, 10, quantile)
-	}
-	require.Panics(maxRequestsTooSmall)
+	_, err = NewHedgingProxy(delegate, 10*time.Millisecond, 10, quantile)
+	require.Error(err)
 
-	invalidQuantileTooSmall := func() {
-		NewHedgingProxy(delegate, 10*time.Millisecond, 1000, 0.0)
-	}
-	require.Panics(invalidQuantileTooSmall)
+	_, err = NewHedgingProxy(delegate, 10*time.Millisecond, 1000, 0.0)
+	require.Error(err)
 
-	invalidQuantileTooLarge := func() {
-		NewHedgingProxy(delegate, 10*time.Millisecond, 1000, 1.0)
-	}
-	require.Panics(invalidQuantileTooLarge)
+	_, err = NewHedgingProxy(delegate, 10*time.Millisecond, 1000, 1.0)
+	require.Error(err)
 }
 
 func TestDatastoreE2E(t *testing.T) {
@@ -289,51 +284,40 @@ func TestDatastoreE2E(t *testing.T) {
 	delegateReader := &proxy_test.MockReader{}
 	mockTime := clock.NewMock()
 
-	proxy := newHedgingProxyWithTimeSource(
+	proxy, err := newHedgingProxyWithTimeSource(
 		delegateDatastore, slowQueryTime, maxSampleCount, quantile, mockTime,
 	)
+	require.NoError(err)
 
-	expectedTuples := []*core.RelationTuple{
-		{
-			ResourceAndRelation: &core.ObjectAndRelation{
-				Namespace: "test",
-				ObjectId:  "test",
-				Relation:  "test",
-			},
-			Subject: &core.ObjectAndRelation{
-				Namespace: "test",
-				ObjectId:  "test",
-				Relation:  "test",
-			},
-		},
+	expectedRels := []tuple.Relationship{
+		tuple.MustParse("document:first#viewer@user:bob"),
+		tuple.MustParse("document:second#viewer@user:alice"),
 	}
 
 	delegateDatastore.On("SnapshotReader", mock.Anything).Return(delegateReader)
 
 	delegateReader.
 		On("QueryRelationships", mock.Anything, mock.Anything).
-		Return(datastore.NewSliceRelationshipIterator(expectedTuples), nil).
+		Return(common.NewSliceRelationshipIterator(expectedRels), nil).
 		WaitUntil(mockTime.After(2 * slowQueryTime)).
 		Once()
 	delegateReader.
 		On("QueryRelationships", mock.Anything, mock.Anything).
-		Return(datastore.NewSliceRelationshipIterator(expectedTuples), nil).
+		Return(common.NewSliceRelationshipIterator(expectedRels), nil).
 		Once()
 
 	autoAdvance(mockTime, slowQueryTime/2, 2*slowQueryTime)
 
 	it, err := proxy.SnapshotReader(revisionKnown).QueryRelationships(
 		context.Background(), datastore.RelationshipsFilter{
-			ResourceType: "test",
+			OptionalResourceType: "document",
 		},
 	)
 	require.NoError(err)
 
-	only := it.Next()
-	require.Equal(expectedTuples[0], only)
-
-	require.Nil(it.Next())
-	require.NoError(it.Err())
+	slice, err := datastore.IteratorToSlice(it)
+	require.NoError(err)
+	require.Equal(expectedRels, slice)
 
 	delegateDatastore.AssertExpectations(t)
 	delegateReader.AssertExpectations(t)
@@ -344,9 +328,10 @@ func TestContextCancellation(t *testing.T) {
 
 	delegate := &proxy_test.MockDatastore{}
 	mockTime := clock.NewMock()
-	proxy := newHedgingProxyWithTimeSource(
+	proxy, err := newHedgingProxyWithTimeSource(
 		delegate, slowQueryTime, maxSampleCount, quantile, mockTime,
 	)
+	require.NoError(err)
 
 	delegate.
 		On("HeadRevision", mock.Anything).
@@ -362,8 +347,7 @@ func TestContextCancellation(t *testing.T) {
 
 	autoAdvance(mockTime, 150*time.Microsecond, 1*time.Millisecond)
 
-	_, err := proxy.HeadRevision(ctx)
-
+	_, err = proxy.HeadRevision(ctx)
 	require.Error(err)
 }
 

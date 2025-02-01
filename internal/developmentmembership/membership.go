@@ -5,6 +5,7 @@ import (
 
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
 
@@ -33,7 +34,7 @@ func NewMembershipSet() *Set {
 // AddExpansion adds the expansion of an ONR to the membership set. Returns false if the ONR was already added.
 //
 // NOTE: The expansion tree *should* be the fully recursive expansion.
-func (ms *Set) AddExpansion(onr *core.ObjectAndRelation, expansion *core.RelationTupleTreeNode) (FoundSubjects, bool, error) {
+func (ms *Set) AddExpansion(onr tuple.ObjectAndRelation, expansion *core.RelationTupleTreeNode) (FoundSubjects, bool, error) {
 	onrString := tuple.StringONR(onr)
 	existing, ok := ms.objectsAndRelations[onrString]
 	if ok {
@@ -52,13 +53,13 @@ func (ms *Set) AddExpansion(onr *core.ObjectAndRelation, expansion *core.Relatio
 
 // AccessibleExpansionSubjects returns a TrackingSubjectSet representing the set of accessible subjects in the expansion.
 func AccessibleExpansionSubjects(treeNode *core.RelationTupleTreeNode) (*TrackingSubjectSet, error) {
-	return populateFoundSubjects(treeNode.Expanded, treeNode)
+	return populateFoundSubjects(tuple.FromCoreObjectAndRelation(treeNode.Expanded), treeNode)
 }
 
-func populateFoundSubjects(rootONR *core.ObjectAndRelation, treeNode *core.RelationTupleTreeNode) (*TrackingSubjectSet, error) {
+func populateFoundSubjects(rootONR tuple.ObjectAndRelation, treeNode *core.RelationTupleTreeNode) (*TrackingSubjectSet, error) {
 	resource := rootONR
 	if treeNode.Expanded != nil {
-		resource = treeNode.Expanded
+		resource = tuple.FromCoreObjectAndRelation(treeNode.Expanded)
 	}
 
 	switch typed := treeNode.NodeType.(type) {
@@ -72,8 +73,13 @@ func populateFoundSubjects(rootONR *core.ObjectAndRelation, treeNode *core.Relat
 					return nil, err
 				}
 
-				toReturn.AddFrom(tss)
+				err = toReturn.AddFrom(tss)
+				if err != nil {
+					return nil, err
+				}
 			}
+
+			toReturn.ApplyParentCaveatExpression(treeNode.CaveatExpression)
 			return toReturn, nil
 
 		case core.SetOperationUserset_INTERSECTION:
@@ -87,15 +93,26 @@ func populateFoundSubjects(rootONR *core.ObjectAndRelation, treeNode *core.Relat
 			}
 
 			toReturn := NewTrackingSubjectSet()
-			toReturn.AddFrom(firstChildSet)
+			err = toReturn.AddFrom(firstChildSet)
+			if err != nil {
+				return nil, err
+			}
 
 			for _, child := range typed.IntermediateNode.ChildNodes[1:] {
 				childSet, err := populateFoundSubjects(rootONR, child)
 				if err != nil {
 					return nil, err
 				}
-				toReturn = toReturn.Intersect(childSet)
+
+				updated, err := toReturn.Intersect(childSet)
+				if err != nil {
+					return nil, err
+				}
+
+				toReturn = updated
 			}
+
+			toReturn.ApplyParentCaveatExpression(treeNode.CaveatExpression)
 			return toReturn, nil
 
 		case core.SetOperationUserset_EXCLUSION:
@@ -109,7 +126,10 @@ func populateFoundSubjects(rootONR *core.ObjectAndRelation, treeNode *core.Relat
 			}
 
 			toReturn := NewTrackingSubjectSet()
-			toReturn.AddFrom(firstChildSet)
+			err = toReturn.AddFrom(firstChildSet)
+			if err != nil {
+				return nil, err
+			}
 
 			for _, child := range typed.IntermediateNode.ChildNodes[1:] {
 				childSet, err := populateFoundSubjects(rootONR, child)
@@ -119,22 +139,29 @@ func populateFoundSubjects(rootONR *core.ObjectAndRelation, treeNode *core.Relat
 				toReturn = toReturn.Exclude(childSet)
 			}
 
+			toReturn.ApplyParentCaveatExpression(treeNode.CaveatExpression)
 			return toReturn, nil
 
 		default:
-			panic("unknown expand operation")
+			return nil, spiceerrors.MustBugf("unknown expand operation")
 		}
 
 	case *core.RelationTupleTreeNode_LeafNode:
 		toReturn := NewTrackingSubjectSet()
 		for _, subject := range typed.LeafNode.Subjects {
 			fs := NewFoundSubject(subject)
-			toReturn.Add(fs)
-			fs.relationships.Add(resource)
+			err := toReturn.Add(fs)
+			if err != nil {
+				return nil, err
+			}
+
+			fs.resources.Add(resource)
 		}
+
+		toReturn.ApplyParentCaveatExpression(treeNode.CaveatExpression)
 		return toReturn, nil
 
 	default:
-		panic("unknown TreeNode type")
+		return nil, spiceerrors.MustBugf("unknown TreeNode type")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"google.golang.org/protobuf/proto"
+	"k8s.io/utils/strings/slices"
 
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/dslshape"
@@ -39,10 +40,65 @@ type CompiledSchema struct {
 	// OrderedDefinitions holds the object and caveat definitions in the schema, in the
 	// order in which they were found.
 	OrderedDefinitions []SchemaDefinition
+
+	rootNode *dslNode
+	mapper   input.PositionMapper
 }
 
+// SourcePositionToRunePosition converts a source position to a rune position.
+func (cs CompiledSchema) SourcePositionToRunePosition(source input.Source, position input.Position) (int, error) {
+	return cs.mapper.LineAndColToRunePosition(position.LineNumber, position.ColumnPosition, source)
+}
+
+type config struct {
+	skipValidation   bool
+	objectTypePrefix *string
+	allowedFlags     []string
+}
+
+func SkipValidation() Option { return func(cfg *config) { cfg.skipValidation = true } }
+
+func ObjectTypePrefix(prefix string) ObjectPrefixOption {
+	return func(cfg *config) { cfg.objectTypePrefix = &prefix }
+}
+
+func RequirePrefixedObjectType() ObjectPrefixOption {
+	return func(cfg *config) { cfg.objectTypePrefix = nil }
+}
+
+func AllowUnprefixedObjectType() ObjectPrefixOption {
+	return func(cfg *config) { cfg.objectTypePrefix = new(string) }
+}
+
+const expirationFlag = "expiration"
+
+func DisallowExpirationFlag() Option {
+	return func(cfg *config) {
+		cfg.allowedFlags = slices.Filter([]string{}, cfg.allowedFlags, func(s string) bool {
+			return s != expirationFlag
+		})
+	}
+}
+
+type Option func(*config)
+
+type ObjectPrefixOption func(*config)
+
 // Compile compilers the input schema into a set of namespace definition protos.
-func Compile(schema InputSchema, objectTypePrefix *string) (*CompiledSchema, error) {
+func Compile(schema InputSchema, prefix ObjectPrefixOption, opts ...Option) (*CompiledSchema, error) {
+	cfg := &config{
+		allowedFlags: make([]string, 0, 1),
+	}
+
+	// Enable `expiration` flag by default.
+	cfg.allowedFlags = append(cfg.allowedFlags, expirationFlag)
+
+	prefix(cfg) // required option
+
+	for _, fn := range opts {
+		fn(cfg)
+	}
+
 	mapper := newPositionMapper(schema)
 	root := parser.Parse(createAstNode, schema.Source, schema.SchemaString).(*dslNode)
 	errs := root.FindAll(dslshape.NodeTypeError)
@@ -52,14 +108,16 @@ func Compile(schema InputSchema, objectTypePrefix *string) (*CompiledSchema, err
 	}
 
 	compiled, err := translate(translationContext{
-		objectTypePrefix: objectTypePrefix,
+		objectTypePrefix: cfg.objectTypePrefix,
 		mapper:           mapper,
 		schemaString:     schema.SchemaString,
+		skipValidate:     cfg.skipValidation,
+		allowedFlags:     cfg.allowedFlags,
 	}, root)
 	if err != nil {
-		var errorWithNode errorWithNode
-		if errors.As(err, &errorWithNode) {
-			err = toContextError(errorWithNode.error.Error(), errorWithNode.errorSourceCode, errorWithNode.node, mapper)
+		var withNodeError withNodeError
+		if errors.As(err, &withNodeError) {
+			err = toContextError(withNodeError.error.Error(), withNodeError.errorSourceCode, withNodeError.node, mapper)
 		}
 
 		return nil, err
@@ -107,7 +165,7 @@ func toContextError(errMessage string, errorSourceCode string, node *dslNode, ma
 		return fmt.Errorf("missing source for node: %w", err)
 	}
 
-	return ErrorWithContext{
+	return WithContextError{
 		BaseCompilerError: BaseCompilerError{
 			error:       fmt.Errorf("parse error in %s: %s", formattedRange, errMessage),
 			BaseMessage: errMessage,

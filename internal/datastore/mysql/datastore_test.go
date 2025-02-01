@@ -11,18 +11,19 @@ import (
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/authzed/spicedb/internal/datastore/common"
 	"github.com/authzed/spicedb/internal/datastore/mysql/migrations"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
 	"github.com/authzed/spicedb/internal/testfixtures"
 	testdatastore "github.com/authzed/spicedb/internal/testserver/datastore"
 	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/datastore/test"
 	"github.com/authzed/spicedb/pkg/migrate"
 	"github.com/authzed/spicedb/pkg/namespace"
-	corev1 "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
 
@@ -30,18 +31,26 @@ const (
 	chunkRelationshipCount = 2000
 )
 
+// Implement TestableDatastore interface
+func (mds *Datastore) ExampleRetryableError() error {
+	return &mysql.MySQLError{
+		Number: errMysqlDeadlock,
+	}
+}
+
 type datastoreTester struct {
 	b      testdatastore.RunningEngineForTest
 	t      *testing.T
 	prefix string
 }
 
-func (dst *datastoreTester) createDatastore(revisionQuantization, gcWindow time.Duration, _ uint16) (datastore.Datastore, error) {
+func (dst *datastoreTester) createDatastore(revisionQuantization, gcInterval, gcWindow time.Duration, _ uint16) (datastore.Datastore, error) {
+	ctx := context.Background()
 	ds := dst.b.NewDatastore(dst.t, func(engine, uri string) datastore.Datastore {
-		ds, err := newMySQLDatastore(uri,
+		ds, err := newMySQLDatastore(ctx, uri, primaryInstanceID,
 			RevisionQuantization(revisionQuantization),
 			GCWindow(gcWindow),
-			GCInterval(0*time.Second),
+			GCInterval(gcInterval),
 			TablePrefix(dst.prefix),
 			DebugAnalyzeBeforeStatistics(),
 			OverrideLockWaitTimeout(1),
@@ -49,7 +58,7 @@ func (dst *datastoreTester) createDatastore(revisionQuantization, gcWindow time.
 		require.NoError(dst.t, err)
 		return ds
 	})
-	_, err := ds.IsReady(context.Background())
+	_, err := ds.ReadyState(context.Background())
 	require.NoError(dst.t, err)
 	return ds, nil
 }
@@ -70,8 +79,9 @@ type datastoreTestFunc func(t *testing.T, ds datastore.Datastore)
 
 func createDatastoreTest(b testdatastore.RunningEngineForTest, tf datastoreTestFunc, options ...Option) func(*testing.T) {
 	return func(t *testing.T) {
+		ctx := context.Background()
 		ds := b.NewDatastore(t, func(engine, uri string) datastore.Datastore {
-			ds, err := newMySQLDatastore(uri, options...)
+			ds, err := newMySQLDatastore(ctx, uri, primaryInstanceID, options...)
 			require.NoError(t, err)
 			return ds
 		})
@@ -81,10 +91,50 @@ func createDatastoreTest(b testdatastore.RunningEngineForTest, tf datastoreTestF
 	}
 }
 
-func TestMySQLDatastore(t *testing.T) {
-	b := testdatastore.RunMySQLForTesting(t, "")
+type multiDatastoreTestFunc func(t *testing.T, ds1 datastore.Datastore, ds2 datastore.Datastore)
+
+func createMultiDatastoreTest(b testdatastore.RunningEngineForTest, tf multiDatastoreTestFunc, options ...Option) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+
+		var secondDS datastore.Datastore
+		ds := b.NewDatastore(t, func(engine, uri string) datastore.Datastore {
+			ds, err := newMySQLDatastore(ctx, uri, primaryInstanceID, options...)
+			require.NoError(t, err)
+
+			ds2, err := newMySQLDatastore(ctx, uri, primaryInstanceID, options...)
+			require.NoError(t, err)
+
+			secondDS = ds2
+			return ds
+		})
+		defer failOnError(t, ds.Close)
+
+		tf(t, ds, secondDS)
+	}
+}
+
+func TestMySQLDatastoreDSNWithoutParseTime(t *testing.T) {
+	_, err := NewMySQLDatastore(context.Background(), "root:password@(localhost:1234)/mysql")
+	require.ErrorContains(t, err, "https://spicedb.dev/d/parse-time-mysql")
+}
+
+func TestMySQL8Datastore(t *testing.T) {
+	b := testdatastore.RunMySQLForTestingWithOptions(t, testdatastore.MySQLTesterOptions{MigrateForNewDatastore: true}, "")
 	dst := datastoreTester{b: b, t: t}
-	test.All(t, test.DatastoreTesterFunc(dst.createDatastore))
+	test.AllWithExceptions(t, test.DatastoreTesterFunc(dst.createDatastore), test.WithCategories(test.WatchSchemaCategory, test.WatchCheckpointsCategory), true)
+	additionalMySQLTests(t, b)
+}
+
+func TestMySQLRevisionTimestamps(t *testing.T) {
+	b := testdatastore.RunMySQLForTestingWithOptions(t, testdatastore.MySQLTesterOptions{MigrateForNewDatastore: true}, "")
+	t.Run("TransactionTimestamps", createDatastoreTest(b, TransactionTimestampsTest, defaultOptions...))
+}
+
+func additionalMySQLTests(t *testing.T, b testdatastore.RunningEngineForTest) {
+	reg := prometheus.NewRegistry()
+	prometheus.DefaultGatherer = reg
+	prometheus.DefaultRegisterer = reg
 
 	t.Run("DatabaseSeeding", createDatastoreTest(b, DatabaseSeedingTest))
 	t.Run("PrometheusCollector", createDatastoreTest(
@@ -95,16 +145,50 @@ func TestMySQLDatastore(t *testing.T) {
 	t.Run("GarbageCollection", createDatastoreTest(b, GarbageCollectionTest, defaultOptions...))
 	t.Run("GarbageCollectionByTime", createDatastoreTest(b, GarbageCollectionByTimeTest, defaultOptions...))
 	t.Run("ChunkedGarbageCollection", createDatastoreTest(b, ChunkedGarbageCollectionTest, defaultOptions...))
-	t.Run("TransactionTimestamps", createDatastoreTest(b, TransactionTimestampsTest, defaultOptions...))
+	t.Run("EmptyGarbageCollection", createDatastoreTest(b, EmptyGarbageCollectionTest, defaultOptions...))
+	t.Run("NoRelationshipsGarbageCollection", createDatastoreTest(b, NoRelationshipsGarbageCollectionTest, defaultOptions...))
 	t.Run("QuantizedRevisions", func(t *testing.T) {
 		QuantizedRevisionTest(t, b)
 	})
+	t.Run("Locking", createMultiDatastoreTest(b, LockingTest, defaultOptions...))
 }
 
-func TestMySQLDatastoreWithTablePrefix(t *testing.T) {
-	b := testdatastore.RunMySQLForTestingWithOptions(t, testdatastore.MySQLTesterOptions{MigrateForNewDatastore: true, Prefix: "spicedb_"}, "")
-	dst := datastoreTester{b: b, t: t, prefix: "spicedb_"}
-	test.All(t, test.DatastoreTesterFunc(dst.createDatastore))
+func LockingTest(t *testing.T, ds datastore.Datastore, ds2 datastore.Datastore) {
+	mds := ds.(*Datastore)
+	mds2 := ds2.(*Datastore)
+
+	// Acquire a lock.
+	ctx := context.Background()
+	acquired, err := mds.tryAcquireLock(ctx, "testing123")
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// Try to acquire the lock again.
+	acquired, err = mds2.tryAcquireLock(ctx, "testing123")
+	require.NoError(t, err)
+	require.False(t, acquired)
+
+	// Acquire another lock.
+	acquired, err = mds.tryAcquireLock(ctx, "testing456")
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// Release the other lock.
+	err = mds.releaseLock(ctx, "testing123")
+	require.NoError(t, err)
+
+	// Release the lock.
+	err = mds.releaseLock(ctx, "testing123")
+	require.NoError(t, err)
+
+	// Try to acquire the lock again.
+	acquired, err = mds2.tryAcquireLock(ctx, "testing123")
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// Release the lock.
+	err = mds2.releaseLock(ctx, "testing123")
+	require.NoError(t, err)
 }
 
 func DatabaseSeedingTest(t *testing.T, ds datastore.Datastore) {
@@ -116,16 +200,16 @@ func DatabaseSeedingTest(t *testing.T, ds datastore.Datastore) {
 	req.NoError(err)
 	req.True(isSeeded, "expected datastore to be seeded after initialization")
 
-	ready, err := ds.IsReady(ctx)
+	r, err := ds.ReadyState(ctx)
 	req.NoError(err)
-	req.True(ready)
+	req.True(r.IsReady)
 }
 
 func PrometheusCollectorTest(t *testing.T, ds datastore.Datastore) {
 	req := require.New(t)
 
 	// cause some use of the SQL connection pool to generate metrics
-	_, err := ds.IsReady(context.Background())
+	_, err := ds.ReadyState(context.Background())
 	req.NoError(err)
 
 	metrics, err := prometheus.DefaultGatherer.Gather()
@@ -147,17 +231,17 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req := require.New(t)
 
 	ctx := context.Background()
-	ok, err := ds.IsReady(ctx)
+	r, err := ds.ReadyState(ctx)
 	req.NoError(err)
-	req.True(ok)
+	req.True(r.IsReady)
 
 	// Write basic namespaces.
-	writtenAt, err := ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	writtenAt, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		return rwt.WriteNamespaces(
 			ctx,
 			namespace.Namespace(
 				"resource",
-				namespace.Relation("reader", nil),
+				namespace.MustRelation("reader", nil),
 			),
 			namespace.Namespace("user"),
 		)
@@ -173,13 +257,13 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Replace the namespace with a new one.
-	writtenAt, err = ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	writtenAt, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		return rwt.WriteNamespaces(
 			ctx,
 			namespace.Namespace(
 				"resource",
-				namespace.Relation("reader", nil),
-				namespace.Relation("unused", nil),
+				namespace.MustRelation("reader", nil),
+				namespace.MustRelation("unused", nil),
 			),
 			namespace.Namespace("user"),
 		)
@@ -194,9 +278,8 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req.Equal(int64(2), removed.Namespaces)
 
 	// Write a relationship.
-
-	tpl := tuple.Parse("resource:someresource#reader@user:someuser#...")
-	relWrittenAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_CREATE, tpl)
+	rel := tuple.MustParse("resource:someresource#reader@user:someuser#...")
+	relWrittenAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rel)
 	req.NoError(err)
 
 	// Run GC at the transaction and ensure no relationships are removed, but 1 transaction (the previous write namespace) is.
@@ -214,11 +297,12 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Ensure the relationship is still present.
-	tRequire := testfixtures.TupleChecker{Require: req, DS: ds}
-	tRequire.TupleExists(ctx, tpl, relWrittenAt)
+	tRequire := testfixtures.RelationshipChecker{Require: req, DS: ds}
+	tRequire.RelationshipExists(ctx, rel, relWrittenAt)
 
 	// Overwrite the relationship.
-	relOverwrittenAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_TOUCH, tpl)
+	crel := tuple.MustWithCaveat(rel, "somecaveat")
+	relOverwrittenAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, crel)
 	req.NoError(err)
 
 	// Run GC at the transaction and ensure the (older copy of the) relationship is removed, as well as 1 transaction (the write).
@@ -236,14 +320,14 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Ensure the relationship is still present.
-	tRequire.TupleExists(ctx, tpl, relOverwrittenAt)
+	tRequire.RelationshipExists(ctx, crel, relOverwrittenAt)
 
 	// Delete the relationship.
-	relDeletedAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_DELETE, tpl)
+	relDeletedAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, crel)
 	req.NoError(err)
 
 	// Ensure the relationship is gone.
-	tRequire.NoTupleExists(ctx, tpl, relDeletedAt)
+	tRequire.NoRelationshipExists(ctx, crel, relDeletedAt)
 
 	// Run GC at the transaction and ensure the relationship is removed, as well as 1 transaction (the overwrite).
 	removed, err = mds.DeleteBeforeTx(ctx, relDeletedAt)
@@ -260,13 +344,16 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Write the relationship a few times.
-	_, err = common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_TOUCH, tpl)
+	crel1 := tuple.MustWithCaveat(rel, "somecaveat1")
+	crel2 := tuple.MustWithCaveat(rel, "somecaveat2")
+	crel3 := tuple.MustWithCaveat(rel, "somecaveat3")
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, crel1)
 	req.NoError(err)
 
-	_, err = common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_TOUCH, tpl)
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, crel2)
 	req.NoError(err)
 
-	relLastWriteAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_TOUCH, tpl)
+	relLastWriteAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, crel3)
 	req.NoError(err)
 
 	// Run GC at the transaction and ensure the older copies of the relationships are removed,
@@ -278,24 +365,24 @@ func GarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Ensure the relationship is still present.
-	tRequire.TupleExists(ctx, tpl, relLastWriteAt)
+	tRequire.RelationshipExists(ctx, crel3, relLastWriteAt)
 }
 
 func GarbageCollectionByTimeTest(t *testing.T, ds datastore.Datastore) {
 	req := require.New(t)
 
 	ctx := context.Background()
-	ok, err := ds.IsReady(ctx)
+	r, err := ds.ReadyState(ctx)
 	req.NoError(err)
-	req.True(ok)
+	req.True(r.IsReady)
 
 	// Write basic namespaces.
-	_, err = ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		return rwt.WriteNamespaces(
 			ctx,
 			namespace.Namespace(
 				"resource",
-				namespace.Relation("reader", nil),
+				namespace.MustRelation("reader", nil),
 			),
 			namespace.Namespace("user"),
 		)
@@ -308,9 +395,9 @@ func GarbageCollectionByTimeTest(t *testing.T, ds datastore.Datastore) {
 	time.Sleep(1 * time.Millisecond)
 
 	// Write a relationship.
-	tpl := tuple.Parse("resource:someresource#reader@user:someuser#...")
+	rel := tuple.MustParse("resource:someresource#reader@user:someuser#...")
 
-	relLastWriteAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_CREATE, tpl)
+	relLastWriteAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rel)
 	req.NoError(err)
 
 	// Run GC and ensure only transactions were removed.
@@ -327,14 +414,14 @@ func GarbageCollectionByTimeTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Ensure the relationship is still present.
-	tRequire := testfixtures.TupleChecker{Require: req, DS: ds}
-	tRequire.TupleExists(ctx, tpl, relLastWriteAt)
+	tRequire := testfixtures.RelationshipChecker{Require: req, DS: ds}
+	tRequire.RelationshipExists(ctx, rel, relLastWriteAt)
 
 	// Sleep 1ms to ensure GC will delete the previous write.
 	time.Sleep(1 * time.Millisecond)
 
 	// Delete the relationship.
-	relDeletedAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_DELETE, tpl)
+	relDeletedAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, rel)
 	req.NoError(err)
 
 	// Run GC and ensure the relationship is removed.
@@ -351,24 +438,85 @@ func GarbageCollectionByTimeTest(t *testing.T, ds datastore.Datastore) {
 	req.Zero(removed.Namespaces)
 
 	// Ensure the relationship is still not present.
-	tRequire.NoTupleExists(ctx, tpl, relDeletedAt)
+	tRequire.NoRelationshipExists(ctx, rel, relDeletedAt)
+}
+
+func EmptyGarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
+	req := require.New(t)
+
+	ctx := context.Background()
+	r, err := ds.ReadyState(ctx)
+	req.NoError(err)
+	req.True(r.IsReady)
+
+	gc := ds.(common.GarbageCollector)
+
+	now, err := gc.Now(ctx)
+	req.NoError(err)
+
+	watermark, err := gc.TxIDBefore(ctx, now.Add(-1*time.Minute))
+	req.NoError(err)
+
+	collected, err := gc.DeleteBeforeTx(ctx, watermark)
+	req.NoError(err)
+
+	req.Equal(int64(0), collected.Relationships)
+	req.Equal(int64(0), collected.Transactions)
+	req.Equal(int64(0), collected.Namespaces)
+}
+
+func NoRelationshipsGarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
+	req := require.New(t)
+
+	ctx := context.Background()
+	r, err := ds.ReadyState(ctx)
+	req.NoError(err)
+	req.True(r.IsReady)
+
+	// Write basic namespaces.
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		return rwt.WriteNamespaces(
+			ctx,
+			namespace.Namespace(
+				"resource",
+				namespace.MustRelation("reader", nil),
+			),
+			namespace.Namespace("user"),
+		)
+	})
+	req.NoError(err)
+
+	gc := ds.(common.GarbageCollector)
+
+	now, err := gc.Now(ctx)
+	req.NoError(err)
+
+	watermark, err := gc.TxIDBefore(ctx, now.Add(-1*time.Minute))
+	req.NoError(err)
+
+	collected, err := gc.DeleteBeforeTx(ctx, watermark)
+	req.NoError(err)
+
+	req.Equal(int64(0), collected.Relationships)
+	req.Equal(int64(0), collected.Transactions)
+	req.Equal(int64(0), collected.Namespaces)
 }
 
 func ChunkedGarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	req := require.New(t)
 
 	ctx := context.Background()
-	ok, err := ds.IsReady(ctx)
+	r, err := ds.ReadyState(ctx)
 	req.NoError(err)
-	req.True(ok)
+	req.True(r.IsReady)
 
 	// Write basic namespaces.
-	_, err = ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		return rwt.WriteNamespaces(
 			ctx,
 			namespace.Namespace(
 				"resource",
-				namespace.Relation("reader", nil),
+				namespace.MustRelation("reader", nil),
 			),
 			namespace.Namespace("user"),
 		)
@@ -378,21 +526,20 @@ func ChunkedGarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	mds := ds.(*Datastore)
 
 	// Prepare relationships to write.
-	var tuples []*corev1.RelationTuple
+	var rels []tuple.Relationship
 	for i := 0; i < chunkRelationshipCount; i++ {
-		tpl := tuple.Parse(fmt.Sprintf("resource:resource-%d#reader@user:someuser#...", i))
-		tuples = append(tuples, tpl)
+		rel := tuple.MustParse(fmt.Sprintf("resource:resource-%d#reader@user:someuser#...", i))
+		rels = append(rels, rel)
 	}
 
 	// Write a large number of relationships.
-
-	writtenAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_CREATE, tuples...)
+	writtenAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
 	req.NoError(err)
 
 	// Ensure the relationships were written.
-	tRequire := testfixtures.TupleChecker{Require: req, DS: ds}
-	for _, tpl := range tuples {
-		tRequire.TupleExists(ctx, tpl, writtenAt)
+	tRequire := testfixtures.RelationshipChecker{Require: req, DS: ds}
+	for _, rel := range rels {
+		tRequire.RelationshipExists(ctx, rel, writtenAt)
 	}
 
 	// Run GC and ensure only transactions were removed.
@@ -412,12 +559,12 @@ func ChunkedGarbageCollectionTest(t *testing.T, ds datastore.Datastore) {
 	time.Sleep(1 * time.Millisecond)
 
 	// Delete all the relationships.
-	deletedAt, err := common.WriteTuples(ctx, ds, corev1.RelationTupleUpdate_DELETE, tuples...)
+	deletedAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, rels...)
 	req.NoError(err)
 
 	// Ensure the relationships were deleted.
-	for _, tpl := range tuples {
-		tRequire.NoTupleExists(ctx, tpl, deletedAt)
+	for _, rel := range rels {
+		tRequire.NoRelationshipExists(ctx, rel, deletedAt)
 	}
 
 	// Sleep to ensure GC.
@@ -484,7 +631,9 @@ func QuantizedRevisionTest(t *testing.T, b testdatastore.RunningEngineForTest) {
 
 			ds := b.NewDatastore(t, func(engine, uri string) datastore.Datastore {
 				ds, err := newMySQLDatastore(
+					ctx,
 					uri,
+					primaryInstanceID,
 					RevisionQuantization(5*time.Second),
 					GCWindow(24*time.Hour),
 					WatchBufferLength(1),
@@ -545,9 +694,9 @@ func TransactionTimestampsTest(t *testing.T, ds datastore.Datastore) {
 	_, err := db.ExecContext(ctx, "SET GLOBAL time_zone = 'America/New_York';")
 	req.NoError(err)
 
-	ok, err := ds.IsReady(ctx)
+	r, err := ds.ReadyState(ctx)
 	req.NoError(err)
-	req.True(ok)
+	req.True(r.IsReady)
 
 	// Get timestamp in UTC as reference
 	startTimeUTC, err := ds.(*Datastore).Now(ctx)
@@ -556,7 +705,7 @@ func TransactionTimestampsTest(t *testing.T, ds datastore.Datastore) {
 	// Transaction timestamp should not be stored in system time zone
 	tx, err := db.BeginTx(ctx, nil)
 	req.NoError(err)
-	txID, err := ds.(*Datastore).createNewTransaction(ctx, tx)
+	txID, err := ds.(*Datastore).createNewTransaction(ctx, tx, nil)
 	req.NoError(err)
 	err = tx.Commit()
 	req.NoError(err)
@@ -572,7 +721,7 @@ func TransactionTimestampsTest(t *testing.T, ds datastore.Datastore) {
 
 	revision, err := ds.OptimizedRevision(ctx)
 	req.NoError(err)
-	req.Equal(revisionFromTransaction(txID), revision)
+	req.Equal(revisions.NewForTransactionID(txID), revision)
 }
 
 func TestMySQLMigrations(t *testing.T) {
@@ -626,6 +775,23 @@ func TestMySQLMigrationsWithPrefix(t *testing.T) {
 		req.Contains(tbl, prefix)
 	}
 	req.NoError(rows.Err())
+}
+
+func TestMySQLWithAWSIAMCredentialsProvider(t *testing.T) {
+	// set up the environment, so we don't make any external calls to AWS
+	t.Setenv("AWS_CONFIG_FILE", "file_not_exists")
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "file_not_exists")
+	t.Setenv("AWS_ENDPOINT_URL", "http://169.254.169.254/aws")
+	t.Setenv("AWS_ACCESS_KEY", "access_key")
+	t.Setenv("AWS_SECRET_KEY", "secret_key")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	// initialize the datastore using the AWS IAM credentials provider, and point it to a database that does not exist
+	_, err := NewMySQLDatastore(context.Background(), "root:password@(localhost:1234)/mysql?parseTime=True&tls=skip-verify", CredentialsProviderName("aws-iam"))
+
+	// we expect the connection attempt to fail
+	// which means that the credentials provider was wired and called successfully before making the connection attempt
+	require.ErrorContains(t, err, ":1234: connect: connection refused")
 }
 
 func datastoreDB(t *testing.T, migrate bool) *sql.DB {

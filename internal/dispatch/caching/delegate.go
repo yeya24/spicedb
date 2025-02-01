@@ -5,38 +5,35 @@ import (
 
 	"github.com/authzed/spicedb/internal/dispatch"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 )
 
 const errMessage = "fake delegate should never be called, call SetDelegate on the parent dispatcher"
 
 type fakeDelegate struct{}
 
-func (fd fakeDelegate) IsReady() bool {
-	panic(errMessage)
+func (fd fakeDelegate) ReadyState() dispatch.ReadyState {
+	return dispatch.ReadyState{}
 }
 
 func (fd fakeDelegate) Close() error {
-	panic(errMessage)
+	return spiceerrors.MustBugf(errMessage)
 }
 
-func (fd fakeDelegate) DispatchCheck(ctx context.Context, req *v1.DispatchCheckRequest) (*v1.DispatchCheckResponse, error) {
-	panic(errMessage)
+func (fd fakeDelegate) DispatchCheck(_ context.Context, _ *v1.DispatchCheckRequest) (*v1.DispatchCheckResponse, error) {
+	return &v1.DispatchCheckResponse{}, spiceerrors.MustBugf(errMessage)
 }
 
-func (fd fakeDelegate) DispatchExpand(ctx context.Context, req *v1.DispatchExpandRequest) (*v1.DispatchExpandResponse, error) {
-	panic(errMessage)
+func (fd fakeDelegate) DispatchExpand(_ context.Context, _ *v1.DispatchExpandRequest) (*v1.DispatchExpandResponse, error) {
+	return &v1.DispatchExpandResponse{}, spiceerrors.MustBugf(errMessage)
 }
 
-func (fd fakeDelegate) DispatchLookup(ctx context.Context, req *v1.DispatchLookupRequest) (*v1.DispatchLookupResponse, error) {
-	panic(errMessage)
+func (fd fakeDelegate) DispatchLookupResources2(_ *v1.DispatchLookupResources2Request, _ dispatch.LookupResources2Stream) error {
+	return spiceerrors.MustBugf(errMessage)
 }
 
-func (fd fakeDelegate) DispatchReachableResources(req *v1.DispatchReachableResourcesRequest, stream dispatch.ReachableResourcesStream) error {
-	panic(errMessage)
-}
-
-func (fd fakeDelegate) DispatchLookupSubjects(req *v1.DispatchLookupSubjectsRequest, stream dispatch.LookupSubjectsStream) error {
-	panic(errMessage)
+func (fd fakeDelegate) DispatchLookupSubjects(_ *v1.DispatchLookupSubjectsRequest, _ dispatch.LookupSubjectsStream) error {
+	return spiceerrors.MustBugf(errMessage)
 }
 
 var _ dispatch.Dispatcher = fakeDelegate{}

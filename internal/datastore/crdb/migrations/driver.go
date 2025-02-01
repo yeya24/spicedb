@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	pgxcommon "github.com/authzed/spicedb/internal/datastore/postgres/common"
 	"github.com/authzed/spicedb/pkg/migrate"
@@ -35,6 +35,7 @@ func NewCRDBDriver(url string) (*CRDBDriver, error) {
 		return nil, fmt.Errorf(errUnableToInstantiate, err)
 	}
 	pgxcommon.ConfigurePGXLogger(connConfig)
+	pgxcommon.ConfigureOTELTracer(connConfig, false)
 
 	db, err := pgx.ConnectConfig(context.Background(), connConfig)
 	if err != nil {
@@ -66,7 +67,7 @@ func (apd *CRDBDriver) Conn() *pgx.Conn {
 }
 
 func (apd *CRDBDriver) RunTx(ctx context.Context, f migrate.TxMigrationFunc[pgx.Tx]) error {
-	return apd.db.BeginFunc(ctx, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, apd.db, func(tx pgx.Tx) error {
 		return f(ctx, tx)
 	})
 }

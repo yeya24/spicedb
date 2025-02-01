@@ -4,6 +4,7 @@ import (
 	"github.com/authzed/spicedb/internal/caveats"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 var (
@@ -23,11 +24,11 @@ type CheckResultsMap map[string]*v1.ResourceCheckResult
 func NewMembershipSet() *MembershipSet {
 	return &MembershipSet{
 		hasDeterminedMember: false,
-		membersByID:         map[string]*v1.CaveatExpression{},
+		membersByID:         map[string]*core.CaveatExpression{},
 	}
 }
 
-func membershipSetFromMap(mp map[string]*v1.CaveatExpression) *MembershipSet {
+func membershipSetFromMap(mp map[string]*core.CaveatExpression) *MembershipSet {
 	ms := NewMembershipSet()
 	for resourceID, result := range mp {
 		ms.addMember(resourceID, result)
@@ -38,7 +39,7 @@ func membershipSetFromMap(mp map[string]*v1.CaveatExpression) *MembershipSet {
 // MembershipSet is a helper set that trackes the membership results for a dispatched Check
 // request, including tracking of the caveats associated with found resource IDs.
 type MembershipSet struct {
-	membersByID         map[string]*v1.CaveatExpression
+	membersByID         map[string]*core.CaveatExpression
 	hasDeterminedMember bool
 }
 
@@ -55,14 +56,43 @@ func (ms *MembershipSet) AddDirectMember(resourceID string, caveat *core.Context
 // associated.
 func (ms *MembershipSet) AddMemberViaRelationship(
 	resourceID string,
-	resourceCaveatExpression *v1.CaveatExpression,
-	parentRelationship *core.RelationTuple,
+	resourceCaveatExpression *core.CaveatExpression,
+	parentRelationship tuple.Relationship,
 ) {
-	intersection := caveatAnd(wrapCaveat(parentRelationship.Caveat), resourceCaveatExpression)
+	ms.AddMemberWithParentCaveat(resourceID, resourceCaveatExpression, parentRelationship.OptionalCaveat)
+}
+
+// AddMemberWithParentCaveat adds the given resource ID as a member with the parent caveat
+// combined via intersection with the resource's caveat. The parent caveat may be nil.
+func (ms *MembershipSet) AddMemberWithParentCaveat(
+	resourceID string,
+	resourceCaveatExpression *core.CaveatExpression,
+	parentCaveat *core.ContextualizedCaveat,
+) {
+	intersection := caveatAnd(wrapCaveat(parentCaveat), resourceCaveatExpression)
 	ms.addMember(resourceID, intersection)
 }
 
-func (ms *MembershipSet) addMember(resourceID string, caveatExpr *v1.CaveatExpression) {
+// AddMemberWithOptionalCaveats adds the given resource ID as a member with the optional caveats combined
+// via intersection.
+func (ms *MembershipSet) AddMemberWithOptionalCaveats(
+	resourceID string,
+	caveats []*core.CaveatExpression,
+) {
+	if len(caveats) == 0 {
+		ms.addMember(resourceID, nil)
+		return
+	}
+
+	intersection := caveats[0]
+	for _, caveat := range caveats[1:] {
+		intersection = caveatAnd(intersection, caveat)
+	}
+
+	ms.addMember(resourceID, intersection)
+}
+
+func (ms *MembershipSet) addMember(resourceID string, caveatExpr *core.CaveatExpression) {
 	existing, ok := ms.membersByID[resourceID]
 	if !ok {
 		ms.hasDeterminedMember = ms.hasDeterminedMember || caveatExpr == nil
@@ -91,7 +121,9 @@ func (ms *MembershipSet) addMember(resourceID string, caveatExpr *v1.CaveatExpre
 // The changes are made in-place.
 func (ms *MembershipSet) UnionWith(resultsMap CheckResultsMap) {
 	for resourceID, details := range resultsMap {
-		ms.addMember(resourceID, details.Expression)
+		if details.Membership != v1.ResourceCheckResult_NOT_MEMBER {
+			ms.addMember(resourceID, details.Expression)
+		}
 	}
 }
 
@@ -99,7 +131,7 @@ func (ms *MembershipSet) UnionWith(resultsMap CheckResultsMap) {
 // The changes are made in-place.
 func (ms *MembershipSet) IntersectWith(resultsMap CheckResultsMap) {
 	for resourceID := range ms.membersByID {
-		if _, ok := resultsMap[resourceID]; !ok {
+		if details, ok := resultsMap[resourceID]; !ok || details.Membership == v1.ResourceCheckResult_NOT_MEMBER {
 			delete(ms.membersByID, resourceID)
 		}
 	}
@@ -107,7 +139,7 @@ func (ms *MembershipSet) IntersectWith(resultsMap CheckResultsMap) {
 	ms.hasDeterminedMember = false
 	for resourceID, details := range resultsMap {
 		existing, ok := ms.membersByID[resourceID]
-		if !ok {
+		if !ok || details.Membership == v1.ResourceCheckResult_NOT_MEMBER {
 			continue
 		}
 		if existing == nil && details.Expression == nil {
@@ -124,7 +156,7 @@ func (ms *MembershipSet) IntersectWith(resultsMap CheckResultsMap) {
 func (ms *MembershipSet) Subtract(resultsMap CheckResultsMap) {
 	ms.hasDeterminedMember = false
 	for resourceID, expression := range ms.membersByID {
-		if details, ok := resultsMap[resourceID]; ok {
+		if details, ok := resultsMap[resourceID]; ok && details.Membership != v1.ResourceCheckResult_NOT_MEMBER {
 			// If the incoming member has no caveat, then this removal is absolute.
 			if details.Expression == nil {
 				delete(ms.membersByID, resourceID)
@@ -140,6 +172,37 @@ func (ms *MembershipSet) Subtract(resultsMap CheckResultsMap) {
 			}
 		}
 	}
+}
+
+// HasConcreteResourceID returns whether the resourceID was found in the set
+// and has no caveat attached.
+func (ms *MembershipSet) HasConcreteResourceID(resourceID string) bool {
+	if ms == nil {
+		return false
+	}
+
+	found, ok := ms.membersByID[resourceID]
+	return ok && found == nil
+}
+
+// GetResourceID returns a bool indicating whether the resource is found in the set and the
+// associated caveat expression, if any.
+func (ms *MembershipSet) GetResourceID(resourceID string) (bool, *core.CaveatExpression) {
+	if ms == nil {
+		return false, nil
+	}
+
+	caveat, ok := ms.membersByID[resourceID]
+	return ok, caveat
+}
+
+// Size returns the number of elements in the membership set.
+func (ms *MembershipSet) Size() int {
+	if ms == nil {
+		return 0
+	}
+
+	return len(ms.membersByID)
 }
 
 // IsEmpty returns true if the set is empty.

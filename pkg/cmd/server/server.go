@@ -6,24 +6,32 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sync"
+	"strconv"
 	"time"
 
+	"github.com/authzed/consistent"
 	"github.com/authzed/grpcutil"
+	"github.com/cespare/xxhash/v2"
+	"github.com/ecordell/optgen/helpers"
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
-	grpcprom "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/hashicorp/go-multierror"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/cors"
 	"github.com/rs/zerolog"
+	"github.com/sean-/sysexits"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/encoding/gzip" // enable gzip compression on all derivative servers
 
 	"github.com/authzed/spicedb/internal/auth"
-	"github.com/authzed/spicedb/internal/dashboard"
 	"github.com/authzed/spicedb/internal/datastore/proxy"
+	"github.com/authzed/spicedb/internal/datastore/proxy/schemacaching"
 	"github.com/authzed/spicedb/internal/dispatch"
 	clusterdispatch "github.com/authzed/spicedb/internal/dispatch/cluster"
 	combineddispatch "github.com/authzed/spicedb/internal/dispatch/combined"
+	"github.com/authzed/spicedb/internal/dispatch/graph"
+	"github.com/authzed/spicedb/internal/dispatch/keys"
 	"github.com/authzed/spicedb/internal/gateway"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/internal/services"
@@ -31,176 +39,314 @@ import (
 	"github.com/authzed/spicedb/internal/services/health"
 	v1svc "github.com/authzed/spicedb/internal/services/v1"
 	"github.com/authzed/spicedb/internal/telemetry"
-	"github.com/authzed/spicedb/pkg/balancer"
+	"github.com/authzed/spicedb/pkg/cache"
 	datastorecfg "github.com/authzed/spicedb/pkg/cmd/datastore"
 	"github.com/authzed/spicedb/pkg/cmd/util"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/middleware/requestid"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 )
+
+// ConsistentHashringBuilder is a balancer Builder that uses xxhash as the
+// underlying hash for the ConsistentHashringBalancers it creates.
+var ConsistentHashringBuilder = consistent.NewBuilder(xxhash.Sum64)
 
 //go:generate go run github.com/ecordell/optgen -output zz_generated.options.go . Config
 type Config struct {
 	// API config
-	GRPCServer             util.GRPCServerConfig
-	GRPCAuthFunc           grpc_auth.AuthFunc
-	PresharedKey           []string
-	ShutdownGracePeriod    time.Duration
-	DisableVersionResponse bool
+	GRPCServer             util.GRPCServerConfig `debugmap:"visible"`
+	GRPCAuthFunc           grpc_auth.AuthFunc    `debugmap:"visible"`
+	PresharedSecureKey     []string              `debugmap:"sensitive"`
+	ShutdownGracePeriod    time.Duration         `debugmap:"visible"`
+	DisableVersionResponse bool                  `debugmap:"visible"`
+	ServerName             string                `debugmap:"visible"`
 
 	// GRPC Gateway config
-	HTTPGateway                    util.HTTPServerConfig
-	HTTPGatewayUpstreamAddr        string
-	HTTPGatewayUpstreamTLSCertPath string
-	HTTPGatewayCorsEnabled         bool
-	HTTPGatewayCorsAllowedOrigins  []string
+	HTTPGateway                    util.HTTPServerConfig `debugmap:"visible"`
+	HTTPGatewayUpstreamAddr        string                `debugmap:"visible"`
+	HTTPGatewayUpstreamTLSCertPath string                `debugmap:"visible"`
+	HTTPGatewayCorsEnabled         bool                  `debugmap:"visible"`
+	HTTPGatewayCorsAllowedOrigins  []string              `debugmap:"visible-format"`
 
 	// Datastore
-	DatastoreConfig datastorecfg.Config
-	Datastore       datastore.Datastore
+	DatastoreConfig datastorecfg.Config `debugmap:"visible"`
+	Datastore       datastore.Datastore `debugmap:"visible"`
+
+	// Datastore usage
+	MaxCaveatContextSize       int `debugmap:"visible" default:"4096"`
+	MaxRelationshipContextSize int `debugmap:"visible" default:"25_000"`
 
 	// Namespace cache
-	NamespaceCacheConfig CacheConfig
+	EnableExperimentalWatchableSchemaCache bool          `debugmap:"visible"`
+	SchemaWatchHeartbeat                   time.Duration `debugmap:"visible"`
+	NamespaceCacheConfig                   CacheConfig   `debugmap:"visible"`
 
 	// Schema options
-	SchemaPrefixesRequired bool
+	SchemaPrefixesRequired bool `debugmap:"visible"`
 
 	// Dispatch options
-	DispatchServer               util.GRPCServerConfig
-	DispatchMaxDepth             uint32
-	DispatchConcurrencyLimit     uint16
-	DispatchUpstreamAddr         string
-	DispatchUpstreamCAPath       string
-	DispatchClientMetricsPrefix  string
-	DispatchClusterMetricsPrefix string
-	Dispatcher                   dispatch.Dispatcher
+	DispatchServer                    util.GRPCServerConfig   `debugmap:"visible"`
+	DispatchMaxDepth                  uint32                  `debugmap:"visible"`
+	GlobalDispatchConcurrencyLimit    uint16                  `debugmap:"visible"`
+	DispatchConcurrencyLimits         graph.ConcurrencyLimits `debugmap:"visible"`
+	DispatchUpstreamAddr              string                  `debugmap:"visible"`
+	DispatchUpstreamCAPath            string                  `debugmap:"visible"`
+	DispatchUpstreamTimeout           time.Duration           `debugmap:"visible"`
+	DispatchClientMetricsEnabled      bool                    `debugmap:"visible"`
+	DispatchClientMetricsPrefix       string                  `debugmap:"visible"`
+	DispatchClusterMetricsEnabled     bool                    `debugmap:"visible"`
+	DispatchClusterMetricsPrefix      string                  `debugmap:"visible"`
+	Dispatcher                        dispatch.Dispatcher     `debugmap:"visible"`
+	DispatchHashringReplicationFactor uint16                  `debugmap:"visible"`
+	DispatchHashringSpread            uint8                   `debugmap:"visible"`
+	DispatchChunkSize                 uint16                  `debugmap:"visible" default:"100"`
 
-	DispatchCacheConfig        CacheConfig
-	ClusterDispatchCacheConfig CacheConfig
+	DispatchSecondaryUpstreamAddrs map[string]string `debugmap:"visible"`
+	DispatchSecondaryUpstreamExprs map[string]string `debugmap:"visible"`
+
+	DispatchCacheConfig        CacheConfig `debugmap:"visible"`
+	ClusterDispatchCacheConfig CacheConfig `debugmap:"visible"`
 
 	// API Behavior
-	DisableV1SchemaAPI         bool
-	V1SchemaAdditiveOnly       bool
-	MaximumUpdatesPerWrite     uint16
-	MaximumPreconditionCount   uint16
-	ExperimentalCaveatsEnabled bool
+	DisableV1SchemaAPI                       bool          `debugmap:"visible"`
+	V1SchemaAdditiveOnly                     bool          `debugmap:"visible"`
+	MaximumUpdatesPerWrite                   uint16        `debugmap:"visible"`
+	MaximumPreconditionCount                 uint16        `debugmap:"visible"`
+	MaxDatastoreReadPageSize                 uint64        `debugmap:"visible"`
+	StreamingAPITimeout                      time.Duration `debugmap:"visible"`
+	WatchHeartbeat                           time.Duration `debugmap:"visible"`
+	MaxReadRelationshipsLimit                uint32        `debugmap:"visible"`
+	MaxDeleteRelationshipsLimit              uint32        `debugmap:"visible"`
+	MaxLookupResourcesLimit                  uint32        `debugmap:"visible"`
+	MaxBulkExportRelationshipsLimit          uint32        `debugmap:"visible"`
+	EnableExperimentalLookupResources        bool          `debugmap:"visible"`
+	EnableExperimentalRelationshipExpiration bool          `debugmap:"visible"`
 
 	// Additional Services
-	DashboardAPI util.HTTPServerConfig
-	MetricsAPI   util.HTTPServerConfig
+	MetricsAPI util.HTTPServerConfig `debugmap:"visible"`
 
-	// Middleware for grpc
-	UnaryMiddleware     []grpc.UnaryServerInterceptor
-	StreamingMiddleware []grpc.StreamServerInterceptor
+	// Middleware for grpc API
+	UnaryMiddlewareModification     []MiddlewareModification[grpc.UnaryServerInterceptor]  `debugmap:"hidden"`
+	StreamingMiddlewareModification []MiddlewareModification[grpc.StreamServerInterceptor] `debugmap:"hidden"`
 
-	// Middleware for dispatch
-	DispatchUnaryMiddleware     []grpc.UnaryServerInterceptor
-	DispatchStreamingMiddleware []grpc.StreamServerInterceptor
+	// Middleware for internal dispatch API
+	DispatchUnaryMiddleware     []grpc.UnaryServerInterceptor  `debugmap:"hidden"`
+	DispatchStreamingMiddleware []grpc.StreamServerInterceptor `debugmap:"hidden"`
 
 	// Telemetry
-	SilentlyDisableTelemetry bool
-	TelemetryCAOverridePath  string
-	TelemetryEndpoint        string
-	TelemetryInterval        time.Duration
+	SilentlyDisableTelemetry bool          `debugmap:"visible"`
+	TelemetryCAOverridePath  string        `debugmap:"visible"`
+	TelemetryEndpoint        string        `debugmap:"visible"`
+	TelemetryInterval        time.Duration `debugmap:"visible"`
+
+	// Logs
+	EnableRequestLogs  bool `debugmap:"visible"`
+	EnableResponseLogs bool `debugmap:"visible"`
+
+	// Metrics
+	DisableGRPCLatencyHistogram bool `debugmap:"visible"`
+}
+
+type closeableStack struct {
+	closers []func() error
+}
+
+func (c *closeableStack) AddWithError(closer func() error) {
+	c.closers = append(c.closers, closer)
+}
+
+func (c *closeableStack) AddCloser(closer io.Closer) {
+	if closer != nil {
+		c.closers = append(c.closers, closer.Close)
+	}
+}
+
+func (c *closeableStack) AddWithoutError(closer func()) {
+	c.closers = append(c.closers, func() error {
+		closer()
+		return nil
+	})
+}
+
+func (c *closeableStack) Close() error {
+	var err error
+	// closer in reverse order how it's expected in deferred funcs
+	for i := len(c.closers) - 1; i >= 0; i-- {
+		if closerErr := c.closers[i](); closerErr != nil {
+			err = multierror.Append(err, closerErr)
+		}
+	}
+	return err
+}
+
+func (c *closeableStack) CloseIfError(err error) error {
+	if err != nil {
+		return c.Close()
+	}
+	return nil
 }
 
 // Complete validates the config and fills out defaults.
 // if there is no error, a completedServerConfig (with limited options for
 // mutation) is returned.
 func (c *Config) Complete(ctx context.Context) (RunnableServer, error) {
-	if len(c.PresharedKey) < 1 && c.GRPCAuthFunc == nil {
+	log.Ctx(ctx).Info().Fields(helpers.Flatten(c.DebugMap())).Msg("configuration")
+
+	closeables := closeableStack{}
+	var err error
+	defer func() {
+		// if an error happens during the execution of Complete, all resources are cleaned up
+		if closeableErr := closeables.CloseIfError(err); closeableErr != nil {
+			log.Ctx(ctx).Err(closeableErr).Msg("failed to clean up resources on Config.Complete")
+		}
+	}()
+
+	if len(c.PresharedSecureKey) < 1 && c.GRPCAuthFunc == nil {
 		return nil, fmt.Errorf("a preshared key must be provided to authenticate API requests")
 	}
 
 	if c.GRPCAuthFunc == nil {
-		log.Trace().Int("preshared-keys-count", len(c.PresharedKey)).Msg("using gRPC auth with preshared key(s)")
-		for index, presharedKey := range c.PresharedKey {
+		log.Ctx(ctx).Trace().Int("preshared-keys-count", len(c.PresharedSecureKey)).Msg("using gRPC auth with preshared key(s)")
+		for index, presharedKey := range c.PresharedSecureKey {
 			if len(presharedKey) == 0 {
 				return nil, fmt.Errorf("preshared key #%d is empty", index+1)
 			}
 
-			log.Trace().Int(fmt.Sprintf("preshared-key-%d-length", index+1), len(presharedKey)).Msg("preshared key configured")
+			log.Ctx(ctx).Trace().Int("preshared-key-"+strconv.Itoa(index+1)+"-length", len(presharedKey)).Msg("preshared key configured")
 		}
 
-		c.GRPCAuthFunc = auth.RequirePresharedKey(c.PresharedKey)
+		c.GRPCAuthFunc = auth.MustRequirePresharedKey(c.PresharedSecureKey)
 	} else {
-		log.Trace().Msg("using preconfigured auth function")
+		log.Ctx(ctx).Trace().Msg("using preconfigured auth function")
 	}
 
 	ds := c.Datastore
 	if ds == nil {
 		var err error
-		ds, err = datastorecfg.NewDatastore(context.Background(), c.DatastoreConfig.ToOption())
+		ds, err = datastorecfg.NewDatastore(context.Background(), c.DatastoreConfig.ToOption(),
+			// Datastore's filter maximum ID count is set to the max size, since the number of elements to be dispatched
+			// are at most the number of elements returned from a datastore query
+			datastorecfg.WithFilterMaximumIDCount(c.DispatchChunkSize),
+			datastorecfg.WithEnableExperimentalRelationshipExpiration(c.EnableExperimentalRelationshipExpiration),
+		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create datastore: %w", err)
+			return nil, spiceerrors.NewTerminationErrorBuilder(fmt.Errorf("failed to create datastore: %w", err)).
+				Component("datastore").
+				ExitCode(sysexits.Config).
+				Error()
 		}
 	}
+	closeables.AddWithError(ds.Close)
 
-	nscc, err := c.NamespaceCacheConfig.Complete()
+	nscc, err := CompleteCache[cache.StringKey, schemacaching.CacheEntry](&c.NamespaceCacheConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create namespace cache: %w", err)
 	}
-	log.Info().EmbedObject(nscc).Msg("configured namespace cache")
+	log.Ctx(ctx).Info().EmbedObject(nscc).Msg("configured namespace cache")
 
-	ds = proxy.NewCachingDatastoreProxy(ds, nscc)
+	cachingMode := schemacaching.JustInTimeCaching
+	if c.EnableExperimentalWatchableSchemaCache {
+		cachingMode = schemacaching.WatchIfSupported
+	}
+
 	ds = proxy.NewObservableDatastoreProxy(ds)
+	ds = proxy.NewSingleflightDatastoreProxy(ds)
+	ds = schemacaching.NewCachingDatastoreProxy(ds, nscc, c.DatastoreConfig.GCWindow, cachingMode, c.SchemaWatchHeartbeat)
+	closeables.AddWithError(ds.Close)
 
-	enableGRPCHistogram()
+	specificConcurrencyLimits := c.DispatchConcurrencyLimits
+	concurrencyLimits := specificConcurrencyLimits.WithOverallDefaultLimit(c.GlobalDispatchConcurrencyLimit)
 
 	dispatcher := c.Dispatcher
 	if dispatcher == nil {
-		var err error
-		cc, cerr := c.DispatchCacheConfig.Complete()
-		if cerr != nil {
-			return nil, fmt.Errorf("failed to create dispatcher: %w", cerr)
+		cc, err := CompleteCache[keys.DispatchCacheKey, any](c.DispatchCacheConfig.WithRevisionParameters(
+			c.DatastoreConfig.RevisionQuantization,
+			c.DatastoreConfig.FollowerReadDelay,
+			c.DatastoreConfig.MaxRevisionStalenessPercent,
+		))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dispatcher: %w", err)
 		}
-		log.Info().EmbedObject(cc).Msg("configured dispatch cache")
+		closeables.AddWithoutError(cc.Close)
+		log.Ctx(ctx).Info().EmbedObject(cc).Msg("configured dispatch cache")
 
 		dispatchPresharedKey := ""
-		if len(c.PresharedKey) > 0 {
-			dispatchPresharedKey = c.PresharedKey[0]
+		if len(c.PresharedSecureKey) > 0 {
+			dispatchPresharedKey = c.PresharedSecureKey[0]
+		}
+
+		hashringConfigJSON, err := (&consistent.BalancerConfig{
+			ReplicationFactor: c.DispatchHashringReplicationFactor,
+			Spread:            c.DispatchHashringSpread,
+		}).ServiceConfigJSON()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gRPC hashring balancer config: %w", err)
 		}
 
 		dispatcher, err = combineddispatch.NewDispatcher(
 			combineddispatch.UpstreamAddr(c.DispatchUpstreamAddr),
 			combineddispatch.UpstreamCAPath(c.DispatchUpstreamCAPath),
+			combineddispatch.SecondaryUpstreamAddrs(c.DispatchSecondaryUpstreamAddrs),
+			combineddispatch.SecondaryUpstreamExprs(c.DispatchSecondaryUpstreamExprs),
 			combineddispatch.GrpcPresharedKey(dispatchPresharedKey),
 			combineddispatch.GrpcDialOpts(
-				grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
-				grpc.WithDefaultServiceConfig(balancer.BalancerServiceConfig),
+				grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+				grpc.WithDefaultServiceConfig(hashringConfigJSON),
+				grpc.WithChainUnaryInterceptor(
+					requestid.UnaryClientInterceptor(),
+				),
+				grpc.WithChainStreamInterceptor(
+					requestid.StreamClientInterceptor(),
+				),
 			),
+			combineddispatch.MetricsEnabled(c.DispatchClientMetricsEnabled),
 			combineddispatch.PrometheusSubsystem(c.DispatchClientMetricsPrefix),
 			combineddispatch.Cache(cc),
-			combineddispatch.ConcurrencyLimit(c.DispatchConcurrencyLimit),
+			combineddispatch.ConcurrencyLimits(concurrencyLimits),
+			combineddispatch.DispatchChunkSize(c.DispatchChunkSize),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create dispatcher: %w", err)
 		}
+
+		log.Ctx(ctx).Info().EmbedObject(concurrencyLimits).RawJSON("balancerconfig", []byte(hashringConfigJSON)).Msg("configured dispatcher")
 	}
+	closeables.AddWithError(dispatcher.Close)
 
 	if len(c.DispatchUnaryMiddleware) == 0 && len(c.DispatchStreamingMiddleware) == 0 {
 		if c.GRPCAuthFunc == nil {
-			c.DispatchUnaryMiddleware, c.DispatchStreamingMiddleware = DefaultDispatchMiddleware(log.Logger, auth.RequirePresharedKey(c.PresharedKey), ds)
+			c.DispatchUnaryMiddleware, c.DispatchStreamingMiddleware = DefaultDispatchMiddleware(log.Logger, auth.MustRequirePresharedKey(c.PresharedSecureKey), ds, c.DisableGRPCLatencyHistogram)
 		} else {
-			c.DispatchUnaryMiddleware, c.DispatchStreamingMiddleware = DefaultDispatchMiddleware(log.Logger, c.GRPCAuthFunc, ds)
+			c.DispatchUnaryMiddleware, c.DispatchStreamingMiddleware = DefaultDispatchMiddleware(log.Logger, c.GRPCAuthFunc, ds, c.DisableGRPCLatencyHistogram)
 		}
 	}
 
 	var cachingClusterDispatch dispatch.Dispatcher
 	if c.DispatchServer.Enabled {
-		cdcc, cerr := c.ClusterDispatchCacheConfig.Complete()
-		if cerr != nil {
-			return nil, fmt.Errorf("failed to configure cluster dispatch: %w", cerr)
+		cdcc, err := CompleteCache[keys.DispatchCacheKey, any](c.ClusterDispatchCacheConfig.WithRevisionParameters(
+			c.DatastoreConfig.RevisionQuantization,
+			c.DatastoreConfig.FollowerReadDelay,
+			c.DatastoreConfig.MaxRevisionStalenessPercent,
+		))
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure cluster dispatch: %w", err)
 		}
-		log.Info().EmbedObject(cdcc).Msg("configured cluster dispatch cache")
+		log.Ctx(ctx).Info().EmbedObject(cdcc).Msg("configured cluster dispatch cache")
+		closeables.AddWithoutError(cdcc.Close)
 
-		var err error
 		cachingClusterDispatch, err = clusterdispatch.NewClusterDispatcher(
 			dispatcher,
+			clusterdispatch.MetricsEnabled(c.DispatchClusterMetricsEnabled),
 			clusterdispatch.PrometheusSubsystem(c.DispatchClusterMetricsPrefix),
 			clusterdispatch.Cache(cdcc),
+			clusterdispatch.RemoteDispatchTimeout(c.DispatchUpstreamTimeout),
+			clusterdispatch.ConcurrencyLimits(concurrencyLimits),
+			clusterdispatch.DispatchChunkSize(c.DispatchChunkSize),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to configure cluster dispatch: %w", err)
 		}
+		closeables.AddWithError(cachingClusterDispatch.Close)
 	}
 
 	dispatchGrpcServer, err := c.DispatchServer.Complete(zerolog.InfoLevel,
@@ -209,10 +355,12 @@ func (c *Config) Complete(ctx context.Context) (RunnableServer, error) {
 		},
 		grpc.ChainUnaryInterceptor(c.DispatchUnaryMiddleware...),
 		grpc.ChainStreamInterceptor(c.DispatchStreamingMiddleware...),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dispatch gRPC server: %w", err)
 	}
+	closeables.AddWithoutError(dispatchGrpcServer.GracefulStop)
 
 	datastoreFeatures, err := ds.Features(ctx)
 	if err != nil {
@@ -227,25 +375,72 @@ func (c *Config) Complete(ctx context.Context) (RunnableServer, error) {
 	}
 
 	watchServiceOption := services.WatchServiceEnabled
-	if !datastoreFeatures.Watch.Enabled {
-		log.Warn().Str("reason", datastoreFeatures.Watch.Reason).Msg("watch api disabled; underlying datastore does not support it")
+	if datastoreFeatures.Watch.Status != datastore.FeatureSupported {
+		log.Ctx(ctx).Warn().Str("reason", datastoreFeatures.Watch.Reason).Msg("watch api disabled; underlying datastore does not support it")
 		watchServiceOption = services.WatchServiceDisabled
 	}
 
-	if len(c.UnaryMiddleware) == 0 && len(c.StreamingMiddleware) == 0 {
-		c.UnaryMiddleware, c.StreamingMiddleware = DefaultMiddleware(log.Logger, c.GRPCAuthFunc, !c.DisableVersionResponse, dispatcher, ds)
+	serverName := c.ServerName
+	if serverName == "" {
+		serverName = "spicedb"
+	}
+
+	opts := MiddlewareOption{
+		log.Logger,
+		c.GRPCAuthFunc,
+		!c.DisableVersionResponse,
+		dispatcher,
+		c.EnableRequestLogs,
+		c.EnableResponseLogs,
+		c.DisableGRPCLatencyHistogram,
+		serverName,
+		nil,
+		nil,
+	}
+	opts = opts.WithDatastore(ds)
+
+	defaultUnaryMiddlewareChain, err := DefaultUnaryMiddleware(opts)
+	if err != nil {
+		return nil, fmt.Errorf("error building default middlewares: %w", err)
+	}
+
+	defaultStreamingMiddlewareChain, err := DefaultStreamingMiddleware(opts)
+	if err != nil {
+		return nil, fmt.Errorf("error building default middlewares: %w", err)
+	}
+
+	sameMiddlewares := defaultUnaryMiddlewareChain.Names().Equal(defaultStreamingMiddlewareChain.Names())
+	if !sameMiddlewares {
+		return nil, fmt.Errorf("unary and streaming middlewares differ: %v / %v",
+			defaultUnaryMiddlewareChain.Names().AsSlice(),
+			defaultStreamingMiddlewareChain.Names().AsSlice(),
+		)
+	}
+
+	unaryMiddleware, err := c.buildUnaryMiddleware(defaultUnaryMiddlewareChain)
+	if err != nil {
+		return nil, fmt.Errorf("error building unary middlewares: %w", err)
+	}
+
+	streamingMiddleware, err := c.buildStreamingMiddleware(defaultStreamingMiddlewareChain)
+	if err != nil {
+		return nil, fmt.Errorf("error building streaming middlewares: %w", err)
 	}
 
 	permSysConfig := v1svc.PermissionsServerConfig{
-		MaxPreconditionsCount: c.MaximumPreconditionCount,
-		MaxUpdatesPerWrite:    c.MaximumUpdatesPerWrite,
-		MaximumAPIDepth:       c.DispatchMaxDepth,
-	}
-
-	caveatsOption := services.CaveatsDisabled
-	if c.ExperimentalCaveatsEnabled {
-		log.Warn().Msg("experimental caveats support enabled")
-		caveatsOption = services.CaveatsEnabled
+		MaxPreconditionsCount:           c.MaximumPreconditionCount,
+		MaxUpdatesPerWrite:              c.MaximumUpdatesPerWrite,
+		MaximumAPIDepth:                 c.DispatchMaxDepth,
+		MaxCaveatContextSize:            c.MaxCaveatContextSize,
+		MaxRelationshipContextSize:      c.MaxRelationshipContextSize,
+		MaxDatastoreReadPageSize:        c.MaxDatastoreReadPageSize,
+		StreamingAPITimeout:             c.StreamingAPITimeout,
+		MaxReadRelationshipsLimit:       c.MaxReadRelationshipsLimit,
+		MaxDeleteRelationshipsLimit:     c.MaxDeleteRelationshipsLimit,
+		MaxLookupResourcesLimit:         c.MaxLookupResourcesLimit,
+		MaxBulkExportRelationshipsLimit: c.MaxBulkExportRelationshipsLimit,
+		DispatchChunkSize:               c.DispatchChunkSize,
+		ExpiringRelationshipsEnabled:    c.EnableExperimentalRelationshipExpiration,
 	}
 
 	healthManager := health.NewHealthManager(dispatcher, ds)
@@ -257,86 +452,102 @@ func (c *Config) Complete(ctx context.Context) (RunnableServer, error) {
 				dispatcher,
 				v1SchemaServiceOption,
 				watchServiceOption,
-				caveatsOption,
 				permSysConfig,
+				c.WatchHeartbeat,
 			)
 		},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC server: %w", err)
 	}
+	closeables.AddWithoutError(grpcServer.GracefulStop)
 
 	gatewayServer, gatewayCloser, err := c.initializeGateway(ctx)
 	if err != nil {
 		return nil, err
 	}
+	closeables.AddCloser(gatewayCloser)
+	closeables.AddWithoutError(gatewayServer.Close)
 
-	dashboardServer, err := c.DashboardAPI.Complete(zerolog.InfoLevel, dashboard.NewHandler(
-		c.GRPCServer.Address,
-		c.GRPCServer.TLSKeyPath != "" || c.GRPCServer.TLSCertPath != "",
-		c.DatastoreConfig.Engine,
-		ds,
-	))
+	infoCollector, err := telemetry.SpiceDBClusterInfoCollector(ctx, "environment", c.DatastoreConfig.Engine, ds)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize dashboard server: %w", err)
+		log.Warn().Err(err).Msg("unable to initialize info collector")
+	} else {
+		if err := prometheus.Register(infoCollector); err != nil {
+			log.Warn().Err(err).Msg("unable to initialize info collector")
+		}
 	}
 
-	registry, err := telemetry.RegisterTelemetryCollector(c.DatastoreConfig.Engine, ds)
-	if err != nil {
-		log.Warn().Err(err).Msg("unable to initialize telemetry collector")
-	}
+	var telemetryRegistry *prometheus.Registry
 
 	reporter := telemetry.DisabledReporter
 	if c.SilentlyDisableTelemetry {
 		reporter = telemetry.SilentlyDisabledReporter
 	} else if c.TelemetryEndpoint != "" && c.DatastoreConfig.DisableStats {
 		reporter = telemetry.DisabledReporter
-	} else if c.TelemetryEndpoint != "" && registry != nil {
-		var err error
-		reporter, err = telemetry.RemoteReporter(
-			registry, c.TelemetryEndpoint, c.TelemetryCAOverridePath, c.TelemetryInterval,
-		)
+	} else if c.TelemetryEndpoint != "" {
+		log.Ctx(ctx).Debug().Msg("initializing telemetry collector")
+		registry, err := telemetry.RegisterTelemetryCollector(c.DatastoreConfig.Engine, ds)
 		if err != nil {
-			return nil, fmt.Errorf("unable to initialize metrics reporter: %w", err)
+			log.Warn().Err(err).Msg("unable to initialize telemetry collector")
+		} else {
+			telemetryRegistry = registry
+			reporter, err = telemetry.RemoteReporter(
+				telemetryRegistry, c.TelemetryEndpoint, c.TelemetryCAOverridePath, c.TelemetryInterval,
+			)
+			if err != nil {
+				log.Warn().Err(err).Msg("unable to initialize telemetry reporter")
+				telemetryRegistry = nil
+				reporter = telemetry.DisabledReporter
+			}
 		}
 	}
 
-	metricsServer, err := c.MetricsAPI.Complete(zerolog.InfoLevel, MetricsHandler(registry))
+	metricsServer, err := c.MetricsAPI.Complete(zerolog.InfoLevel, MetricsHandler(telemetryRegistry, c))
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize metrics server: %w", err)
 	}
+	closeables.AddWithoutError(metricsServer.Close)
 
 	return &completedServerConfig{
+		ds:                  ds,
 		gRPCServer:          grpcServer,
 		dispatchGRPCServer:  dispatchGrpcServer,
 		gatewayServer:       gatewayServer,
 		metricsServer:       metricsServer,
-		dashboardServer:     dashboardServer,
-		unaryMiddleware:     c.UnaryMiddleware,
-		streamingMiddleware: c.StreamingMiddleware,
-		presharedKeys:       c.PresharedKey,
+		unaryMiddleware:     unaryMiddleware,
+		streamingMiddleware: streamingMiddleware,
+		presharedKeys:       c.PresharedSecureKey,
 		telemetryReporter:   reporter,
 		healthManager:       healthManager,
-		closeFunc: func() error {
-			if err := ds.Close(); err != nil {
-				return err
-			}
-			if err := dispatcher.Close(); err != nil {
-				return err
-			}
-			if cachingClusterDispatch != nil {
-				if err := cachingClusterDispatch.Close(); err != nil {
-					return err
-				}
-			}
-			if gatewayCloser != nil {
-				if err := gatewayCloser.Close(); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
+		closeFunc:           closeables.Close,
 	}, nil
+}
+
+func (c *Config) buildUnaryMiddleware(defaultMiddleware *MiddlewareChain[grpc.UnaryServerInterceptor]) ([]grpc.UnaryServerInterceptor, error) {
+	chain := MiddlewareChain[grpc.UnaryServerInterceptor]{}
+	if defaultMiddleware != nil {
+		chain.chain = append(chain.chain, defaultMiddleware.chain...)
+	}
+
+	if err := chain.modify(c.UnaryMiddlewareModification...); err != nil {
+		return nil, err
+	}
+
+	return chain.ToGRPCInterceptors(), nil
+}
+
+func (c *Config) buildStreamingMiddleware(defaultMiddleware *MiddlewareChain[grpc.StreamServerInterceptor]) ([]grpc.StreamServerInterceptor, error) {
+	chain := MiddlewareChain[grpc.StreamServerInterceptor]{}
+	if defaultMiddleware != nil {
+		chain.chain = append(chain.chain, defaultMiddleware.chain...)
+	}
+
+	if err := chain.modify(c.StreamingMiddlewareModification...); err != nil {
+		return nil, err
+	}
+
+	return chain.ToGRPCInterceptors(), nil
 }
 
 // initializeGateway Configures the gateway to serve HTTP
@@ -344,13 +555,23 @@ func (c *Config) initializeGateway(ctx context.Context) (util.RunnableHTTPServer
 	if len(c.HTTPGatewayUpstreamAddr) == 0 {
 		c.HTTPGatewayUpstreamAddr = c.GRPCServer.Address
 	} else {
-		log.Info().Str("upstream", c.HTTPGatewayUpstreamAddr).Msg("Overriding REST gateway upstream")
+		log.Ctx(ctx).Info().Str("upstream", c.HTTPGatewayUpstreamAddr).Msg("Overriding REST gateway upstream")
 	}
 
 	if len(c.HTTPGatewayUpstreamTLSCertPath) == 0 {
 		c.HTTPGatewayUpstreamTLSCertPath = c.GRPCServer.TLSCertPath
 	} else {
-		log.Info().Str("cert-path", c.HTTPGatewayUpstreamTLSCertPath).Msg("Overriding REST gateway upstream TLS")
+		log.Ctx(ctx).Info().Str("cert-path", c.HTTPGatewayUpstreamTLSCertPath).Msg("Overriding REST gateway upstream TLS")
+	}
+
+	// If the requested network is a buffered one, then disable the HTTPGateway.
+	if c.GRPCServer.Network == util.BufferedNetwork {
+		c.HTTPGateway.HTTPEnabled = false
+		gatewayServer, err := c.HTTPGateway.Complete(zerolog.InfoLevel, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed skipping rest gateway initialization: %w", err)
+		}
+		return gatewayServer, nil, nil
 	}
 
 	var gatewayHandler http.Handler
@@ -361,7 +582,7 @@ func (c *Config) initializeGateway(ctx context.Context) (util.RunnableHTTPServer
 	gatewayHandler = closeableGatewayHandler
 
 	if c.HTTPGatewayCorsEnabled {
-		log.Info().Strs("origins", c.HTTPGatewayCorsAllowedOrigins).Msg("Setting REST gateway CORS policy")
+		log.Ctx(ctx).Info().Strs("origins", c.HTTPGatewayCorsAllowedOrigins).Msg("Setting REST gateway CORS policy")
 		gatewayHandler = cors.New(cors.Options{
 			AllowedOrigins:   c.HTTPGatewayCorsAllowedOrigins,
 			AllowCredentials: true,
@@ -370,8 +591,8 @@ func (c *Config) initializeGateway(ctx context.Context) (util.RunnableHTTPServer
 		}).Handler(gatewayHandler)
 	}
 
-	if c.HTTPGateway.Enabled {
-		log.Info().Str("upstream", c.HTTPGatewayUpstreamAddr).Msg("starting REST gateway")
+	if c.HTTPGateway.HTTPEnabled {
+		log.Ctx(ctx).Info().Str("upstream", c.HTTPGatewayUpstreamAddr).Msg("starting REST gateway")
 	}
 
 	gatewayServer, err := c.HTTPGateway.Complete(zerolog.InfoLevel, gatewayHandler)
@@ -384,8 +605,6 @@ func (c *Config) initializeGateway(ctx context.Context) (util.RunnableHTTPServer
 // RunnableServer is a spicedb service set ready to run
 type RunnableServer interface {
 	Run(ctx context.Context) error
-	Middleware() ([]grpc.UnaryServerInterceptor, []grpc.StreamServerInterceptor)
-	SetMiddleware(unaryInterceptors []grpc.UnaryServerInterceptor, streamingInterceptors []grpc.StreamServerInterceptor) RunnableServer
 	GRPCDialContext(ctx context.Context, opts ...grpc.DialOption) (*grpc.ClientConn, error)
 	DispatchNetDialContext(ctx context.Context, s string) (net.Conn, error)
 }
@@ -394,11 +613,12 @@ type RunnableServer interface {
 // but is assumed have already been validated via `Complete()` on Config.
 // It offers limited options for mutation before Run() starts the services.
 type completedServerConfig struct {
+	ds datastore.Datastore
+
 	gRPCServer         util.RunnableGRPCServer
 	dispatchGRPCServer util.RunnableGRPCServer
 	gatewayServer      util.RunnableHTTPServer
 	metricsServer      util.RunnableHTTPServer
-	dashboardServer    util.RunnableHTTPServer
 	telemetryReporter  telemetry.Reporter
 	healthManager      health.Manager
 
@@ -406,16 +626,6 @@ type completedServerConfig struct {
 	streamingMiddleware []grpc.StreamServerInterceptor
 	presharedKeys       []string
 	closeFunc           func() error
-}
-
-func (c *completedServerConfig) Middleware() ([]grpc.UnaryServerInterceptor, []grpc.StreamServerInterceptor) {
-	return c.unaryMiddleware, c.streamingMiddleware
-}
-
-func (c *completedServerConfig) SetMiddleware(unaryInterceptors []grpc.UnaryServerInterceptor, streamingInterceptors []grpc.StreamServerInterceptor) RunnableServer {
-	c.unaryMiddleware = unaryInterceptors
-	c.streamingMiddleware = streamingInterceptors
-	return c
 }
 
 func (c *completedServerConfig) GRPCDialContext(ctx context.Context, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
@@ -435,15 +645,16 @@ func (c *completedServerConfig) DispatchNetDialContext(ctx context.Context, s st
 }
 
 func (c *completedServerConfig) Run(ctx context.Context) error {
-	g, ctx := errgroup.WithContext(ctx)
-
-	stopOnCancel := func(stopFn func()) func() error {
-		return func() error {
-			<-ctx.Done()
-			stopFn()
-			return nil
+	log.Ctx(ctx).Info().Type("datastore", c.ds).Msg("running server")
+	if startable := datastore.UnwrapAs[datastore.StartableDatastore](c.ds); startable != nil {
+		log.Ctx(ctx).Info().Msg("Start-ing datastore")
+		err := startable.Start(ctx)
+		if err != nil {
+			return err
 		}
 	}
+
+	g, ctx := errgroup.WithContext(ctx)
 
 	stopOnCancelWithErr := func(stopFn func() error) func() error {
 		return func() error {
@@ -452,45 +663,24 @@ func (c *completedServerConfig) Run(ctx context.Context) error {
 		}
 	}
 
-	grpcServer := c.gRPCServer.WithOpts(grpc.ChainUnaryInterceptor(c.unaryMiddleware...), grpc.ChainStreamInterceptor(c.streamingMiddleware...))
+	grpcServer := c.gRPCServer.WithOpts(
+		grpc.ChainUnaryInterceptor(c.unaryMiddleware...),
+		grpc.ChainStreamInterceptor(c.streamingMiddleware...),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()))
+
 	g.Go(c.healthManager.Checker(ctx))
 	g.Go(grpcServer.Listen(ctx))
-	g.Go(stopOnCancel(grpcServer.GracefulStop))
-
 	g.Go(c.dispatchGRPCServer.Listen(ctx))
-	g.Go(stopOnCancel(c.dispatchGRPCServer.GracefulStop))
-
 	g.Go(c.gatewayServer.ListenAndServe)
-	g.Go(stopOnCancel(c.gatewayServer.Close))
-
 	g.Go(c.metricsServer.ListenAndServe)
-	g.Go(stopOnCancel(c.metricsServer.Close))
-
-	g.Go(c.dashboardServer.ListenAndServe)
-	g.Go(stopOnCancel(c.dashboardServer.Close))
-
 	g.Go(func() error { return c.telemetryReporter(ctx) })
 
 	g.Go(stopOnCancelWithErr(c.closeFunc))
 
 	if err := g.Wait(); err != nil {
-		log.Warn().Err(err).Msg("error shutting down server")
+		log.Ctx(ctx).Warn().Err(err).Msg("error shutting down server")
 		return err
 	}
 
 	return nil
-}
-
-var promOnce sync.Once
-
-// enableGRPCHistogram enables the standard time history for gRPC requests,
-// ensuring that it is only enabled once
-func enableGRPCHistogram() {
-	// EnableHandlingTimeHistogram is not thread safe and only needs to happen
-	// once
-	promOnce.Do(func() {
-		grpcprom.EnableHandlingTimeHistogram(grpcprom.WithHistogramBuckets(
-			[]float64{.006, .010, .018, .024, .032, .042, .056, .075, .100, .178, .316, .562, 1.000},
-		))
-	})
 }

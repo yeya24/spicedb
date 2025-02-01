@@ -4,11 +4,13 @@
 package datastore
 
 import (
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/authzed/spicedb/internal/datastore/postgres/version"
 	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/migrate"
 )
@@ -62,11 +64,15 @@ func RunDatastoreEngineWithBridge(t testing.TB, engine string, bridgeNetworkName
 	case "cockroachdb":
 		return RunCRDBForTesting(t, bridgeNetworkName)
 	case "postgres":
-		return RunPostgresForTesting(t, bridgeNetworkName, migrate.Head)
+		ver := os.Getenv("POSTGRES_TEST_VERSION")
+		if ver == "" {
+			ver = version.LatestTestedPostgresVersion
+		}
+		return RunPostgresForTesting(t, bridgeNetworkName, migrate.Head, ver, false)
 	case "mysql":
 		return RunMySQLForTesting(t, bridgeNetworkName)
 	case "spanner":
-		return RunSpannerForTesting(t, bridgeNetworkName)
+		return RunSpannerForTesting(t, bridgeNetworkName, migrate.Head)
 	default:
 		t.Fatalf("found missing engine for RunDatastoreEngine: %s", engine)
 		return nil

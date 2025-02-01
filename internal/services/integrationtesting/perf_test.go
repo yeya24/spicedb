@@ -5,12 +5,12 @@ package integrationtesting_test
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
-	"github.com/jzelinskie/stringz"
 	"github.com/stretchr/testify/require"
 
 	"github.com/authzed/spicedb/internal/datastore/spanner"
@@ -30,7 +30,7 @@ func TestBurst(t *testing.T) {
 	}
 
 	for _, engine := range datastore.Engines {
-		if stringz.SliceContains(blacklist, engine) {
+		if slices.Contains(blacklist, engine) {
 			continue
 		}
 		b := testdatastore.RunDatastoreEngine(t, engine)
@@ -38,7 +38,9 @@ func TestBurst(t *testing.T) {
 			ds := b.NewDatastore(t, config.DatastoreConfigInitFunc(t,
 				dsconfig.WithWatchBufferLength(0),
 				dsconfig.WithGCWindow(time.Duration(90_000_000_000_000)),
-				dsconfig.WithRevisionQuantization(10)))
+				dsconfig.WithRevisionQuantization(10),
+				dsconfig.WithMaxRetries(50),
+				dsconfig.WithRequestHedgingEnabled(false)))
 			ds, revision := tf.StandardDatastoreWithData(ds, require.New(t))
 
 			conns, cleanup := testserver.TestClusterWithDispatch(t, 1, ds)
@@ -47,7 +49,7 @@ func TestBurst(t *testing.T) {
 			client := v1.NewPermissionsServiceClient(conns[0])
 			var wg sync.WaitGroup
 			for i := 0; i < 100; i++ {
-				rel := tuple.MustToRelationship(tuple.Parse(tf.StandardTuples[i%(len(tf.StandardTuples))]))
+				rel := tuple.ToV1Relationship(tuple.MustParse(tf.StandardRelationships[i%(len(tf.StandardRelationships))]))
 				run := make(chan struct{})
 				wg.Add(1)
 				go func() {
@@ -56,7 +58,7 @@ func TestBurst(t *testing.T) {
 					_, err := client.CheckPermission(context.Background(), &v1.CheckPermissionRequest{
 						Consistency: &v1.Consistency{
 							Requirement: &v1.Consistency_AtLeastAsFresh{
-								AtLeastAsFresh: zedtoken.NewFromRevision(revision),
+								AtLeastAsFresh: zedtoken.MustNewFromRevision(revision),
 							},
 						},
 						Resource:   rel.Resource,

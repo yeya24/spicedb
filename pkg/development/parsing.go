@@ -1,6 +1,9 @@
 package development
 
 import (
+	"github.com/ccoveille/go-safecast"
+
+	log "github.com/authzed/spicedb/internal/logging"
 	devinterface "github.com/authzed/spicedb/pkg/proto/developer/v1"
 	"github.com/authzed/spicedb/pkg/spiceerrors"
 	"github.com/authzed/spicedb/pkg/validationfile"
@@ -11,7 +14,7 @@ import (
 func ParseAssertionsYAML(assertionsYaml string) (*blocks.Assertions, *devinterface.DeveloperError) {
 	assertions, err := validationfile.ParseAssertionsBlock([]byte(assertionsYaml))
 	if err != nil {
-		serr, ok := spiceerrors.AsErrorWithSource(err)
+		serr, ok := spiceerrors.AsWithSourceError(err)
 		if ok {
 			return nil, convertSourceError(devinterface.DeveloperError_ASSERTION, serr)
 		}
@@ -24,7 +27,7 @@ func ParseAssertionsYAML(assertionsYaml string) (*blocks.Assertions, *devinterfa
 func ParseExpectedRelationsYAML(expectedRelationsYaml string) (*blocks.ParsedExpectedRelations, *devinterface.DeveloperError) {
 	block, err := validationfile.ParseExpectedRelationsBlock([]byte(expectedRelationsYaml))
 	if err != nil {
-		serr, ok := spiceerrors.AsErrorWithSource(err)
+		serr, ok := spiceerrors.AsWithSourceError(err)
 		if ok {
 			return nil, convertSourceError(devinterface.DeveloperError_VALIDATION_YAML, serr)
 		}
@@ -45,13 +48,22 @@ func convertError(source devinterface.DeveloperError_Source, err error) *devinte
 	}
 }
 
-func convertSourceError(source devinterface.DeveloperError_Source, err *spiceerrors.ErrorWithSource) *devinterface.DeveloperError {
+func convertSourceError(source devinterface.DeveloperError_Source, err *spiceerrors.WithSourceError) *devinterface.DeveloperError {
+	// NOTE: zeroes are fine here to mean "unknown"
+	lineNumber, castErr := safecast.ToUint32(err.LineNumber)
+	if castErr != nil {
+		log.Err(castErr).Msg("could not cast lineNumber to uint32")
+	}
+	columnPosition, castErr := safecast.ToUint32(err.ColumnPosition)
+	if castErr != nil {
+		log.Err(castErr).Msg("could not cast columnPosition to uint32")
+	}
 	return &devinterface.DeveloperError{
 		Message: err.Error(),
 		Kind:    devinterface.DeveloperError_PARSE_ERROR,
 		Source:  source,
-		Line:    uint32(err.LineNumber),
-		Column:  uint32(err.ColumnPosition),
+		Line:    lineNumber,
+		Column:  columnPosition,
 		Context: err.SourceCodeString,
 	}
 }

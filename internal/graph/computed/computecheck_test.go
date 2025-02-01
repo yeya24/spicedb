@@ -2,10 +2,13 @@ package computed_test
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/authzed/spicedb/internal/datastore/dsfortesting"
 	"github.com/authzed/spicedb/internal/datastore/memdb"
 	"github.com/authzed/spicedb/internal/dispatch/graph"
 	"github.com/authzed/spicedb/internal/graph/computed"
@@ -13,7 +16,6 @@ import (
 	datastoremw "github.com/authzed/spicedb/internal/middleware/datastore"
 	"github.com/authzed/spicedb/pkg/caveats/types"
 	"github.com/authzed/spicedb/pkg/datastore"
-	"github.com/authzed/spicedb/pkg/datastore/revision"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/compiler"
@@ -23,7 +25,7 @@ import (
 )
 
 type caveatedUpdate struct {
-	Operation  core.RelationTupleUpdate_Operation
+	Operation  tuple.UpdateOperation
 	tuple      string
 	caveatName string
 	context    map[string]any
@@ -66,28 +68,29 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			}
 
 			caveat anothercaveat(anothercondition uint) {
-				int(anothercondition) == 15
+				anothercondition == 15
 			}
 			`,
 			[]caveatedUpdate{
-				{core.RelationTupleUpdate_CREATE, "organization:someorg#admin@user:sarah", "testcaveat", nil},
-				{core.RelationTupleUpdate_CREATE, "organization:someorg#admin@user:john", "testcaveat", map[string]any{"somecondition": "42", "somebool": true}},
-				{core.RelationTupleUpdate_CREATE, "organization:someorg#admin@user:jane", "", nil},
-				{core.RelationTupleUpdate_CREATE, "document:foo#org@organization:someorg", "anothercaveat", nil},
-				{core.RelationTupleUpdate_CREATE, "document:bar#org@organization:someorg", "", nil},
-				{core.RelationTupleUpdate_CREATE, "document:foo#editor@user:vic", "testcaveat", map[string]any{"somecondition": "42", "somebool": true}},
-				{core.RelationTupleUpdate_CREATE, "document:foo#viewer@user:vic", "testcaveat", map[string]any{"somecondition": "42", "somebool": true}},
-				{core.RelationTupleUpdate_CREATE, "document:foo#viewer@user:blippy", "testcaveat", map[string]any{"somecondition": "42", "somebool": false}},
-				{core.RelationTupleUpdate_CREATE, "document:foo#viewer@user:noa", "testcaveat", map[string]any{"somecondition": "42", "somebool": false}},
-				{core.RelationTupleUpdate_CREATE, "document:foo#editor@user:noa", "testcaveat", map[string]any{"somecondition": "42", "somebool": false}},
-				{core.RelationTupleUpdate_CREATE, "document:foo#editor@user:wayne", "invalid", nil},
+				{tuple.UpdateOperationCreate, "organization:someorg#admin@user:sarah", "testcaveat", nil},
+				{tuple.UpdateOperationCreate, "organization:someorg#admin@user:john", "testcaveat", map[string]any{"somecondition": "42", "somebool": true}},
+				{tuple.UpdateOperationCreate, "organization:someorg#admin@user:jane", "", nil},
+				{tuple.UpdateOperationCreate, "document:foo#org@organization:someorg", "anothercaveat", nil},
+				{tuple.UpdateOperationCreate, "document:bar#org@organization:someorg", "", nil},
+				{tuple.UpdateOperationCreate, "document:foo#editor@user:vic", "testcaveat", map[string]any{"somecondition": "42", "somebool": true}},
+				{tuple.UpdateOperationCreate, "document:foo#viewer@user:vic", "testcaveat", map[string]any{"somecondition": "42", "somebool": true}},
+				{tuple.UpdateOperationCreate, "document:foo#viewer@user:blippy", "testcaveat", map[string]any{"somecondition": "42", "somebool": false}},
+				{tuple.UpdateOperationCreate, "document:foo#viewer@user:noa", "testcaveat", map[string]any{"somecondition": "42", "somebool": false}},
+				{tuple.UpdateOperationCreate, "document:foo#editor@user:noa", "testcaveat", map[string]any{"somecondition": "42", "somebool": false}},
+				{tuple.UpdateOperationCreate, "document:foo#editor@user:wayne", "invalid", nil},
 			},
+
 			[]check{
 				{
 					"document:foo#view@user:sarah",
 					nil,
 					v1.ResourceCheckResult_CAVEATED_MEMBER,
-					[]string{"anothercondition"},
+					[]string{"anothercondition", "somecondition", "somebool"},
 					"",
 				},
 				{
@@ -96,7 +99,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 						"somecondition": "42",
 					},
 					v1.ResourceCheckResult_CAVEATED_MEMBER,
-					[]string{"anothercondition"},
+					[]string{"anothercondition", "somebool"},
 					"",
 				},
 				{
@@ -105,7 +108,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 						"anothercondition": "15",
 					},
 					v1.ResourceCheckResult_CAVEATED_MEMBER,
-					[]string{"somecondition"},
+					[]string{"somecondition", "somebool"},
 					"",
 				},
 				{
@@ -193,7 +196,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			}
 			`,
 			[]caveatedUpdate{
-				{core.RelationTupleUpdate_CREATE, "document:foo#viewer@user:tom", "testcaveat", map[string]any{
+				{tuple.UpdateOperationCreate, "document:foo#viewer@user:tom", "testcaveat", map[string]any{
 					"somecondition": 41, // not allowed
 				}},
 			},
@@ -236,13 +239,13 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"document:foo#viewer@user:tom",
 					"viewcaveat",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"document:foo#editor@user:tom",
 					"editcaveat",
 					nil,
@@ -301,13 +304,13 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"document:foo#viewer@user:tom",
 					"viewcaveat",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"document:foo#banned@user:tom",
 					"bannedcaveat",
 					nil,
@@ -370,25 +373,25 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"repository:foobar#owner@organization:myorg",
 					"",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"organization:myorg#members@user:johndoe",
 					"",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"repository:foobar#reader@user:johndoe",
 					"",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"organization:myorg#ip_allowlist_policy@organization:myorg#members",
 					"ip_allowlist",
 					map[string]any{
@@ -447,7 +450,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"group:ui_apps#member@application:frontend_app",
 					"attributes_match",
 					map[string]any{
@@ -455,7 +458,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 					},
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"group:backend_apps#member@application:backend_app",
 					"attributes_match",
 					map[string]any{
@@ -539,7 +542,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"resource:foo#creation_policy@root:root#actors",
 					"created_before",
 					map[string]any{
@@ -547,7 +550,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 					},
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"root:root#actors@actor:johndoe",
 					"",
 					nil,
@@ -588,7 +591,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			definition user {}`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"resource:foo#reader@user:sarah",
 					"not_expired",
 					map[string]any{
@@ -597,7 +600,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 					},
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"resource:foo#reader@user:john",
 					"not_expired",
 					map[string]any{
@@ -641,13 +644,13 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			}`,
 			[]caveatedUpdate{
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"user:son#dependent_of@user:father",
 					"",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"claim:broken_leg#dependent_of@user:son#dependent_of",
 					"legal_guardian",
 					map[string]any{
@@ -656,13 +659,13 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 					},
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"user:daughter#dependent_of@user:father",
 					"",
 					nil,
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"claim:broken_arm#dependent_of@user:daughter#dependent_of",
 					"legal_guardian",
 					map[string]any{
@@ -671,7 +674,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 					},
 				},
 				{
-					core.RelationTupleUpdate_CREATE,
+					tuple.UpdateOperationCreate,
 					"claim:sensitive_matter#dependent_of@user:daughter#dependent_of",
 					"legal_guardian",
 					map[string]any{
@@ -719,7 +722,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			}
 			`,
 			[]caveatedUpdate{
-				{core.RelationTupleUpdate_CREATE, "document:foo#viewer@user:sarah", "testcaveat", nil},
+				{tuple.UpdateOperationCreate, "document:foo#viewer@user:sarah", "testcaveat", nil},
 			},
 			[]check{
 				{
@@ -757,7 +760,7 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 				permission view = viewer
 			}`,
 			[]caveatedUpdate{
-				{core.RelationTupleUpdate_CREATE, "document:foo#viewer@user:sarah", "testcaveat", nil},
+				{tuple.UpdateOperationCreate, "document:foo#viewer@user:sarah", "testcaveat", nil},
 			},
 			[]check{
 				{
@@ -801,11 +804,12 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			ds, err := memdb.NewMemdbDatastore(0, 0, memdb.DisableGC)
+			ds, err := dsfortesting.NewMemDBDatastoreForTesting(0, 0, memdb.DisableGC)
 			require.NoError(t, err)
 
-			dispatch := graph.NewLocalOnlyDispatcher(10)
+			dispatch := graph.NewLocalOnlyDispatcher(10, 100)
 			ctx := log.Logger.WithContext(datastoremw.ContextWithHandle(context.Background()))
 			require.NoError(t, datastoremw.SetInContext(ctx, ds))
 
@@ -813,22 +817,21 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, r := range tt.checks {
-				t.Run(r.check, func(t *testing.T) {
+				r := r
+				t.Run(fmt.Sprintf("%s::%v", r.check, r.context), func(t *testing.T) {
 					rel := tuple.MustParse(r.check)
 
 					result, _, err := computed.ComputeCheck(ctx, dispatch,
 						computed.CheckParameters{
-							ResourceType: &core.RelationReference{
-								Namespace: rel.ResourceAndRelation.Namespace,
-								Relation:  rel.ResourceAndRelation.Relation,
-							},
-							Subject:            rel.Subject,
-							CaveatContext:      r.context,
-							AtRevision:         revision,
-							MaximumDepth:       50,
-							IsDebuggingEnabled: true,
+							ResourceType:  rel.Resource.RelationReference(),
+							Subject:       rel.Subject,
+							CaveatContext: r.context,
+							AtRevision:    revision,
+							MaximumDepth:  50,
+							DebugOption:   computed.BasicDebuggingEnabled,
 						},
-						rel.ResourceAndRelation.ObjectId,
+						rel.Resource.ObjectID,
+						100,
 					)
 
 					if r.error != "" {
@@ -839,7 +842,11 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 						require.Equal(t, v1.ResourceCheckResult_Membership_name[int32(r.member)], v1.ResourceCheckResult_Membership_name[int32(result.Membership)], "mismatch for %s with context %v", r.check, r.context)
 
 						if result.Membership == v1.ResourceCheckResult_CAVEATED_MEMBER {
-							require.Equal(t, r.expectedMissingFields, result.MissingExprFields)
+							foundFields := result.MissingExprFields
+							sort.Strings(foundFields)
+							sort.Strings(r.expectedMissingFields)
+
+							require.Equal(t, r.expectedMissingFields, foundFields)
 						}
 					}
 				})
@@ -849,35 +856,33 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 }
 
 func TestComputeCheckError(t *testing.T) {
-	ds, err := memdb.NewMemdbDatastore(0, 0, memdb.DisableGC)
+	ds, err := dsfortesting.NewMemDBDatastoreForTesting(0, 0, memdb.DisableGC)
 	require.NoError(t, err)
 
-	dispatch := graph.NewLocalOnlyDispatcher(10)
+	dispatch := graph.NewLocalOnlyDispatcher(10, 100)
 	ctx := log.Logger.WithContext(datastoremw.ContextWithHandle(context.Background()))
 	require.NoError(t, datastoremw.SetInContext(ctx, ds))
 
 	_, _, err = computed.ComputeCheck(ctx, dispatch,
 		computed.CheckParameters{
-			ResourceType: &core.RelationReference{
-				Namespace: "a",
-				Relation:  "b",
-			},
-			Subject:            &core.ObjectAndRelation{},
-			CaveatContext:      nil,
-			AtRevision:         revision.NoRevision,
-			MaximumDepth:       50,
-			IsDebuggingEnabled: true,
+			ResourceType:  tuple.RR("a", "b"),
+			Subject:       tuple.ONR("c", "d", "..."),
+			CaveatContext: nil,
+			AtRevision:    datastore.NoRevision,
+			MaximumDepth:  50,
+			DebugOption:   computed.BasicDebuggingEnabled,
 		},
 		"id",
+		100,
 	)
 	require.Error(t, err)
 }
 
 func TestComputeBulkCheck(t *testing.T) {
-	ds, err := memdb.NewMemdbDatastore(0, 0, memdb.DisableGC)
+	ds, err := dsfortesting.NewMemDBDatastoreForTesting(0, 0, memdb.DisableGC)
 	require.NoError(t, err)
 
-	dispatch := graph.NewLocalOnlyDispatcher(10)
+	dispatch := graph.NewLocalOnlyDispatcher(10, 100)
 	ctx := log.Logger.WithContext(datastoremw.ContextWithHandle(context.Background()))
 	require.NoError(t, datastoremw.SetInContext(ctx, ds))
 
@@ -893,34 +898,28 @@ func TestComputeBulkCheck(t *testing.T) {
 		permission view = viewer
 	}
 	`, []caveatedUpdate{
-		{core.RelationTupleUpdate_CREATE, "document:direct#viewer@user:tom", "", nil},
-		{core.RelationTupleUpdate_CREATE, "document:first#viewer@user:tom", "somecaveat", map[string]any{
+		{tuple.UpdateOperationCreate, "document:direct#viewer@user:tom", "", nil},
+		{tuple.UpdateOperationCreate, "document:first#viewer@user:tom", "somecaveat", map[string]any{
 			"somecondition": 42,
 		}},
-		{core.RelationTupleUpdate_CREATE, "document:second#viewer@user:tom", "somecaveat", map[string]any{}},
-		{core.RelationTupleUpdate_CREATE, "document:third#viewer@user:tom", "somecaveat", map[string]any{
+		{tuple.UpdateOperationCreate, "document:second#viewer@user:tom", "somecaveat", map[string]any{}},
+		{tuple.UpdateOperationCreate, "document:third#viewer@user:tom", "somecaveat", map[string]any{
 			"somecondition": 32,
 		}},
 	})
 	require.NoError(t, err)
 
-	resp, _, err := computed.ComputeBulkCheck(ctx, dispatch,
+	resp, _, _, err := computed.ComputeBulkCheck(ctx, dispatch,
 		computed.CheckParameters{
-			ResourceType: &core.RelationReference{
-				Namespace: "document",
-				Relation:  "view",
-			},
-			Subject: &core.ObjectAndRelation{
-				Namespace: "user",
-				ObjectId:  "tom",
-				Relation:  "...",
-			},
-			CaveatContext:      nil,
-			AtRevision:         revision,
-			MaximumDepth:       50,
-			IsDebuggingEnabled: true,
+			ResourceType:  tuple.RR("document", "view"),
+			Subject:       tuple.ONR("user", "tom", "..."),
+			CaveatContext: nil,
+			AtRevision:    revision,
+			MaximumDepth:  50,
+			DebugOption:   computed.NoDebugging,
 		},
 		[]string{"direct", "first", "second", "third"},
+		100,
 	)
 	require.NoError(t, err)
 
@@ -930,17 +929,16 @@ func TestComputeBulkCheck(t *testing.T) {
 	require.Equal(t, resp["third"].Membership, v1.ResourceCheckResult_NOT_MEMBER)
 }
 
-func writeCaveatedTuples(ctx context.Context, t *testing.T, ds datastore.Datastore, schema string, updates []caveatedUpdate) (datastore.Revision, error) {
-	empty := ""
+func writeCaveatedTuples(ctx context.Context, _ *testing.T, ds datastore.Datastore, schema string, updates []caveatedUpdate) (datastore.Revision, error) {
 	compiled, err := compiler.Compile(compiler.InputSchema{
 		Source:       "schema",
 		SchemaString: schema,
-	}, &empty)
+	}, compiler.AllowUnprefixedObjectType())
 	if err != nil {
 		return datastore.NoRevision, err
 	}
 
-	return ds.ReadWriteTx(ctx, func(rwt datastore.ReadWriteTransaction) error {
+	return ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 		if err := rwt.WriteNamespaces(ctx, compiled.ObjectDefinitions...); err != nil {
 			return err
 		}
@@ -949,11 +947,11 @@ func writeCaveatedTuples(ctx context.Context, t *testing.T, ds datastore.Datasto
 			return err
 		}
 
-		var rtu []*core.RelationTupleUpdate
+		var rtu []tuple.RelationshipUpdate
 		for _, updt := range updates {
-			rtu = append(rtu, &core.RelationTupleUpdate{
-				Operation: updt.Operation,
-				Tuple:     caveatedRelationTuple(updt.tuple, updt.caveatName, updt.context),
+			rtu = append(rtu, tuple.RelationshipUpdate{
+				Operation:    updt.Operation,
+				Relationship: caveatedRelationTuple(updt.tuple, updt.caveatName, updt.context),
 			})
 		}
 
@@ -961,14 +959,14 @@ func writeCaveatedTuples(ctx context.Context, t *testing.T, ds datastore.Datasto
 	})
 }
 
-func caveatedRelationTuple(relationTuple string, caveatName string, context map[string]any) *core.RelationTuple {
+func caveatedRelationTuple(relationTuple string, caveatName string, context map[string]any) tuple.Relationship {
 	c := tuple.MustParse(relationTuple)
 	strct, err := structpb.NewStruct(context)
 	if err != nil {
 		panic(err)
 	}
 	if caveatName != "" {
-		c.Caveat = &core.ContextualizedCaveat{
+		c.OptionalCaveat = &core.ContextualizedCaveat{
 			CaveatName: caveatName,
 			Context:    strct,
 		}

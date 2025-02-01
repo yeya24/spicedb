@@ -3,20 +3,22 @@ package caching
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"testing"
 	"unsafe"
 
-	"golang.org/x/exp/maps"
-
 	"github.com/dustin/go-humanize"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/authzed/spicedb/internal/dispatch"
 	"github.com/authzed/spicedb/internal/dispatch/keys"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/cache"
+	"github.com/authzed/spicedb/pkg/middleware/nodeid"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 )
 
@@ -29,29 +31,21 @@ const (
 // Dispatcher is a dispatcher with cacheInst-in caching.
 type Dispatcher struct {
 	d          dispatch.Dispatcher
-	c          cache.Cache
+	c          cache.Cache[keys.DispatchCacheKey, any]
 	keyHandler keys.Handler
 
-	checkTotalCounter                  prometheus.Counter
-	checkFromCacheCounter              prometheus.Counter
-	lookupTotalCounter                 prometheus.Counter
-	lookupFromCacheCounter             prometheus.Counter
-	reachableResourcesTotalCounter     prometheus.Counter
-	reachableResourcesFromCacheCounter prometheus.Counter
-	lookupSubjectsTotalCounter         prometheus.Counter
-	lookupSubjectsFromCacheCounter     prometheus.Counter
-
-	cacheHits        prometheus.CounterFunc
-	cacheMisses      prometheus.CounterFunc
-	costAddedBytes   prometheus.CounterFunc
-	costEvictedBytes prometheus.CounterFunc
+	checkTotalCounter               prometheus.Counter
+	checkFromCacheCounter           prometheus.Counter
+	lookupResourcesTotalCounter     prometheus.Counter
+	lookupResourcesFromCacheCounter prometheus.Counter
+	lookupSubjectsTotalCounter      prometheus.Counter
+	lookupSubjectsFromCacheCounter  prometheus.Counter
 }
 
-func DispatchTestCache(t testing.TB) cache.Cache {
-	cache, err := cache.NewCache(&cache.Config{
+func DispatchTestCache(t testing.TB) cache.Cache[keys.DispatchCacheKey, any] {
+	cache, err := cache.NewStandardCache[keys.DispatchCacheKey, any](&cache.Config{
 		NumCounters: 1000,
 		MaxCost:     1 * humanize.MiByte,
-		Metrics:     true,
 	})
 	require.Nil(t, err)
 	return cache
@@ -59,9 +53,9 @@ func DispatchTestCache(t testing.TB) cache.Cache {
 
 // NewCachingDispatcher creates a new dispatch.Dispatcher which delegates
 // dispatch requests and caches the responses when possible and desirable.
-func NewCachingDispatcher(cacheInst cache.Cache, prometheusSubsystem string, keyHandler keys.Handler) (*Dispatcher, error) {
+func NewCachingDispatcher(cacheInst cache.Cache[keys.DispatchCacheKey, any], metricsEnabled bool, prometheusSubsystem string, keyHandler keys.Handler) (*Dispatcher, error) {
 	if cacheInst == nil {
-		cacheInst = cache.NoopCache()
+		cacheInst = cache.NoopCache[keys.DispatchCacheKey, any]()
 	}
 
 	checkTotalCounter := prometheus.NewCounter(prometheus.CounterOpts{
@@ -75,26 +69,15 @@ func NewCachingDispatcher(cacheInst cache.Cache, prometheusSubsystem string, key
 		Name:      "check_from_cache_total",
 	})
 
-	lookupTotalCounter := prometheus.NewCounter(prometheus.CounterOpts{
+	lookupResourcesTotalCounter := prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: prometheusNamespace,
 		Subsystem: prometheusSubsystem,
-		Name:      "lookup_total",
+		Name:      "lookup_resources_total",
 	})
-	lookupFromCacheCounter := prometheus.NewCounter(prometheus.CounterOpts{
+	lookupResourcesFromCacheCounter := prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: prometheusNamespace,
 		Subsystem: prometheusSubsystem,
-		Name:      "lookup_from_cache_total",
-	})
-
-	reachableResourcesTotalCounter := prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: prometheusNamespace,
-		Subsystem: prometheusSubsystem,
-		Name:      "reachable_resources_total",
-	})
-	reachableResourcesFromCacheCounter := prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: prometheusNamespace,
-		Subsystem: prometheusSubsystem,
-		Name:      "reachable_resources_from_cache_total",
+		Name:      "lookup_resources_from_cache_total",
 	})
 
 	lookupSubjectsTotalCounter := prometheus.NewCounter(prometheus.CounterOpts{
@@ -108,38 +91,7 @@ func NewCachingDispatcher(cacheInst cache.Cache, prometheusSubsystem string, key
 		Name:      "lookup_subjects_from_cache_total",
 	})
 
-	cacheHitsTotal := prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Namespace: prometheusNamespace,
-		Subsystem: prometheusSubsystem,
-		Name:      "cache_hits_total",
-	}, func() float64 {
-		return float64(cacheInst.GetMetrics().Hits())
-	})
-	cacheMissesTotal := prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Namespace: prometheusNamespace,
-		Subsystem: prometheusSubsystem,
-		Name:      "cache_misses_total",
-	}, func() float64 {
-		return float64(cacheInst.GetMetrics().Misses())
-	})
-
-	costAddedBytes := prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Namespace: prometheusNamespace,
-		Subsystem: prometheusSubsystem,
-		Name:      "cost_added_bytes",
-	}, func() float64 {
-		return float64(cacheInst.GetMetrics().CostAdded())
-	})
-
-	costEvictedBytes := prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Namespace: prometheusNamespace,
-		Subsystem: prometheusSubsystem,
-		Name:      "cost_evicted_bytes",
-	}, func() float64 {
-		return float64(cacheInst.GetMetrics().CostEvicted())
-	})
-
-	if prometheusSubsystem != "" {
+	if metricsEnabled && prometheusSubsystem != "" {
 		err := prometheus.Register(checkTotalCounter)
 		if err != nil {
 			return nil, fmt.Errorf(errCachingInitialization, err)
@@ -148,19 +100,11 @@ func NewCachingDispatcher(cacheInst cache.Cache, prometheusSubsystem string, key
 		if err != nil {
 			return nil, fmt.Errorf(errCachingInitialization, err)
 		}
-		err = prometheus.Register(lookupTotalCounter)
+		err = prometheus.Register(lookupResourcesTotalCounter)
 		if err != nil {
 			return nil, fmt.Errorf(errCachingInitialization, err)
 		}
-		err = prometheus.Register(lookupFromCacheCounter)
-		if err != nil {
-			return nil, fmt.Errorf(errCachingInitialization, err)
-		}
-		err = prometheus.Register(reachableResourcesTotalCounter)
-		if err != nil {
-			return nil, fmt.Errorf(errCachingInitialization, err)
-		}
-		err = prometheus.Register(reachableResourcesFromCacheCounter)
+		err = prometheus.Register(lookupResourcesFromCacheCounter)
 		if err != nil {
 			return nil, fmt.Errorf(errCachingInitialization, err)
 		}
@@ -172,24 +116,6 @@ func NewCachingDispatcher(cacheInst cache.Cache, prometheusSubsystem string, key
 		if err != nil {
 			return nil, fmt.Errorf(errCachingInitialization, err)
 		}
-
-		// Export some ristretto metrics
-		err = prometheus.Register(cacheHitsTotal)
-		if err != nil {
-			return nil, fmt.Errorf(errCachingInitialization, err)
-		}
-		err = prometheus.Register(cacheMissesTotal)
-		if err != nil {
-			return nil, fmt.Errorf(errCachingInitialization, err)
-		}
-		err = prometheus.Register(costAddedBytes)
-		if err != nil {
-			return nil, fmt.Errorf(errCachingInitialization, err)
-		}
-		err = prometheus.Register(costEvictedBytes)
-		if err != nil {
-			return nil, fmt.Errorf(errCachingInitialization, err)
-		}
 	}
 
 	if keyHandler == nil {
@@ -197,21 +123,15 @@ func NewCachingDispatcher(cacheInst cache.Cache, prometheusSubsystem string, key
 	}
 
 	return &Dispatcher{
-		d:                                  fakeDelegate{},
-		c:                                  cacheInst,
-		keyHandler:                         keyHandler,
-		checkTotalCounter:                  checkTotalCounter,
-		checkFromCacheCounter:              checkFromCacheCounter,
-		lookupTotalCounter:                 lookupTotalCounter,
-		lookupFromCacheCounter:             lookupFromCacheCounter,
-		reachableResourcesTotalCounter:     reachableResourcesTotalCounter,
-		reachableResourcesFromCacheCounter: reachableResourcesFromCacheCounter,
-		lookupSubjectsTotalCounter:         lookupSubjectsTotalCounter,
-		lookupSubjectsFromCacheCounter:     lookupSubjectsFromCacheCounter,
-		cacheHits:                          cacheHitsTotal,
-		cacheMisses:                        cacheMissesTotal,
-		costAddedBytes:                     costAddedBytes,
-		costEvictedBytes:                   costEvictedBytes,
+		d:                               fakeDelegate{},
+		c:                               cacheInst,
+		keyHandler:                      keyHandler,
+		checkTotalCounter:               checkTotalCounter,
+		checkFromCacheCounter:           checkFromCacheCounter,
+		lookupResourcesTotalCounter:     lookupResourcesTotalCounter,
+		lookupResourcesFromCacheCounter: lookupResourcesFromCacheCounter,
+		lookupSubjectsTotalCounter:      lookupSubjectsTotalCounter,
+		lookupSubjectsFromCacheCounter:  lookupSubjectsFromCacheCounter,
 	}, nil
 }
 
@@ -230,6 +150,7 @@ func (cd *Dispatcher) DispatchCheck(ctx context.Context, req *v1.DispatchCheckRe
 	}
 
 	// Disable caching when debugging is enabled.
+	span := trace.SpanFromContext(ctx)
 	if cachedResultRaw, found := cd.c.Get(requestKey); found {
 		var response v1.DispatchCheckResponse
 		if err := response.UnmarshalVT(cachedResultRaw.([]byte)); err != nil {
@@ -239,19 +160,27 @@ func (cd *Dispatcher) DispatchCheck(ctx context.Context, req *v1.DispatchCheckRe
 		if req.Metadata.DepthRemaining >= response.Metadata.DepthRequired {
 			cd.checkFromCacheCounter.Inc()
 			// If debugging is requested, add the req and the response to the trace.
-			if req.Debug == v1.DispatchCheckRequest_ENABLE_DEBUGGING {
+			if req.Debug == v1.DispatchCheckRequest_ENABLE_BASIC_DEBUGGING {
+				nodeID, err := nodeid.FromContext(ctx)
+				if err != nil {
+					log.Err(err).Msg("failed to get nodeID from context")
+				}
+
 				response.Metadata.DebugInfo = &v1.DebugInformation{
 					Check: &v1.CheckDebugTrace{
 						Request:        req,
 						Results:        maps.Clone(response.ResultsByResourceId),
 						IsCachedResult: true,
+						SourceId:       nodeID,
 					},
 				}
 			}
 
+			span.SetAttributes(attribute.Bool("cached", true))
 			return &response, nil
 		}
 	}
+	span.SetAttributes(attribute.Bool("cached", false))
 	computed, err := cd.d.DispatchCheck(ctx, req)
 
 	// We only want to cache the result if there was no error
@@ -280,72 +209,33 @@ func (cd *Dispatcher) DispatchExpand(ctx context.Context, req *v1.DispatchExpand
 	return resp, err
 }
 
-// DispatchLookup implements dispatch.Lookup interface and does not do any caching yet.
-func (cd *Dispatcher) DispatchLookup(ctx context.Context, req *v1.DispatchLookupRequest) (*v1.DispatchLookupResponse, error) {
-	cd.lookupTotalCounter.Inc()
-
-	requestKey, err := cd.keyHandler.LookupResourcesCacheKey(ctx, req)
-	if err != nil {
-		return &v1.DispatchLookupResponse{Metadata: &v1.ResponseMeta{}}, err
-	}
-
-	if cachedResultRaw, found := cd.c.Get(requestKey); found {
-		var response v1.DispatchLookupResponse
-		if err := response.UnmarshalVT(cachedResultRaw.([]byte)); err != nil {
-			return &v1.DispatchLookupResponse{Metadata: &v1.ResponseMeta{}}, err
-		}
-
-		if req.Metadata.DepthRemaining >= response.Metadata.DepthRequired {
-			log.Trace().Object("cachedLookup", req).Int("resultCount", len(response.ResolvedResources)).Send()
-			cd.lookupFromCacheCounter.Inc()
-			return &response, nil
-		}
-	}
-	computed, err := cd.d.DispatchLookup(ctx, req)
-
-	// We only want to cache the result if there was no error.
-	if err == nil {
-		log.Trace().Object("cachingLookup", req).Int("resultCount", len(computed.ResolvedResources)).Send()
-
-		adjustedComputed := computed.CloneVT()
-		adjustedComputed.Metadata.CachedDispatchCount = adjustedComputed.Metadata.DispatchCount
-		adjustedComputed.Metadata.DispatchCount = 0
-		adjustedComputed.Metadata.DebugInfo = nil
-
-		adjustedBytes, err := adjustedComputed.MarshalVT()
-		if err != nil {
-			return &v1.DispatchLookupResponse{Metadata: &v1.ResponseMeta{}}, err
-		}
-
-		cd.c.Set(requestKey, adjustedBytes, sliceSize(adjustedBytes))
-	}
-
-	// Return both the computed and err in ALL cases: computed contains resolved
-	// metadata even if there was an error.
-	return computed, err
+func sliceSize(xs []byte) int64 {
+	// Slice Header + Slice Contents
+	return int64(int(unsafe.Sizeof(xs)) + len(xs))
 }
 
-// DispatchReachableResources implements dispatch.ReachableResources interface.
-func (cd *Dispatcher) DispatchReachableResources(req *v1.DispatchReachableResourcesRequest, stream dispatch.ReachableResourcesStream) error {
-	cd.reachableResourcesTotalCounter.Inc()
+func (cd *Dispatcher) DispatchLookupResources2(req *v1.DispatchLookupResources2Request, stream dispatch.LookupResources2Stream) error {
+	cd.lookupResourcesTotalCounter.Inc()
 
-	requestKey, err := cd.keyHandler.ReachableResourcesCacheKey(stream.Context(), req)
+	requestKey, err := cd.keyHandler.LookupResources2CacheKey(stream.Context(), req)
 	if err != nil {
 		return err
 	}
 
 	if cachedResultRaw, found := cd.c.Get(requestKey); found {
-		cd.reachableResourcesFromCacheCounter.Inc()
+		cd.lookupResourcesFromCacheCounter.Inc()
 		for _, slice := range cachedResultRaw.([][]byte) {
-			var response v1.DispatchReachableResourcesResponse
+			var response v1.DispatchLookupResources2Response
 			if err := response.UnmarshalVT(slice); err != nil {
-				return fmt.Errorf("could not publish cached reachable resources result: %w", err)
+				return err
 			}
 			if err := stream.Publish(&response); err != nil {
-				return fmt.Errorf("could not publish cached reachable resources result: %w", err)
+				// don't wrap error with additional context, as it may be a grpc status.Status.
+				// status.FromError() is unable to unwrap status.Status values, and as a consequence
+				// the Dispatcher wouldn't properly propagate the gRPC error code
+				return err
 			}
 		}
-
 		return nil
 	}
 
@@ -353,10 +243,10 @@ func (cd *Dispatcher) DispatchReachableResources(req *v1.DispatchReachableResour
 		mu             sync.Mutex
 		toCacheResults [][]byte
 	)
-	wrapped := &dispatch.WrappedDispatchStream[*v1.DispatchReachableResourcesResponse]{
+	wrapped := &dispatch.WrappedDispatchStream[*v1.DispatchLookupResources2Response]{
 		Stream: stream,
 		Ctx:    stream.Context(),
-		Processor: func(result *v1.DispatchReachableResourcesResponse) (*v1.DispatchReachableResourcesResponse, bool, error) {
+		Processor: func(result *v1.DispatchLookupResources2Response) (*v1.DispatchLookupResources2Response, bool, error) {
 			adjustedResult := result.CloneVT()
 			adjustedResult.Metadata.CachedDispatchCount = adjustedResult.Metadata.DispatchCount
 			adjustedResult.Metadata.DispatchCount = 0
@@ -364,7 +254,7 @@ func (cd *Dispatcher) DispatchReachableResources(req *v1.DispatchReachableResour
 
 			adjustedBytes, err := adjustedResult.MarshalVT()
 			if err != nil {
-				return nil, false, err
+				return &v1.DispatchLookupResources2Response{Metadata: &v1.ResponseMeta{}}, false, err
 			}
 
 			mu.Lock()
@@ -375,7 +265,7 @@ func (cd *Dispatcher) DispatchReachableResources(req *v1.DispatchReachableResour
 		},
 	}
 
-	if err := cd.d.DispatchReachableResources(req, wrapped); err != nil {
+	if err := cd.d.DispatchLookupResources2(req, wrapped); err != nil {
 		return err
 	}
 
@@ -386,11 +276,6 @@ func (cd *Dispatcher) DispatchReachableResources(req *v1.DispatchReachableResour
 
 	cd.c.Set(requestKey, toCacheResults, size)
 	return nil
-}
-
-func sliceSize(xs []byte) int64 {
-	// Slice Header + Slice Contents
-	return int64(int(unsafe.Sizeof(xs)) + len(xs))
 }
 
 // DispatchLookupSubjects implements dispatch.LookupSubjects interface.
@@ -460,17 +345,11 @@ func (cd *Dispatcher) DispatchLookupSubjects(req *v1.DispatchLookupSubjectsReque
 
 func (cd *Dispatcher) Close() error {
 	prometheus.Unregister(cd.checkTotalCounter)
-	prometheus.Unregister(cd.lookupTotalCounter)
-	prometheus.Unregister(cd.reachableResourcesTotalCounter)
-	prometheus.Unregister(cd.lookupFromCacheCounter)
 	prometheus.Unregister(cd.checkFromCacheCounter)
-	prometheus.Unregister(cd.reachableResourcesFromCacheCounter)
+	prometheus.Unregister(cd.lookupResourcesTotalCounter)
+	prometheus.Unregister(cd.lookupResourcesFromCacheCounter)
 	prometheus.Unregister(cd.lookupSubjectsFromCacheCounter)
 	prometheus.Unregister(cd.lookupSubjectsTotalCounter)
-	prometheus.Unregister(cd.cacheHits)
-	prometheus.Unregister(cd.cacheMisses)
-	prometheus.Unregister(cd.costAddedBytes)
-	prometheus.Unregister(cd.costEvictedBytes)
 	if cache := cd.c; cache != nil {
 		cache.Close()
 	}
@@ -478,8 +357,22 @@ func (cd *Dispatcher) Close() error {
 	return nil
 }
 
-func (cd *Dispatcher) IsReady() bool {
-	return cd.c != nil && cd.d.IsReady()
+func (cd *Dispatcher) ReadyState() dispatch.ReadyState {
+	if cd.c == nil {
+		return dispatch.ReadyState{
+			IsReady: false,
+			Message: "caching dispatcher is missing cache",
+		}
+	}
+
+	if cd.d == nil {
+		return dispatch.ReadyState{
+			IsReady: false,
+			Message: "caching dispatcher is missing delegate dispatcher",
+		}
+	}
+
+	return cd.d.ReadyState()
 }
 
 // Always verify that we implement the interfaces

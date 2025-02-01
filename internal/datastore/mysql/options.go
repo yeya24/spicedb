@@ -3,6 +3,9 @@ package mysql
 import (
 	"fmt"
 	"time"
+
+	"github.com/authzed/spicedb/internal/datastore/common"
+	log "github.com/authzed/spicedb/internal/logging"
 )
 
 const (
@@ -15,12 +18,16 @@ const (
 	defaultConnMaxIdleTime                   = 30 * time.Minute
 	defaultConnMaxLifetime                   = 30 * time.Minute
 	defaultWatchBufferLength                 = 128
-	defaultUsersetBatchSize                  = 1024
+	defaultWatchBufferWriteTimeout           = 1 * time.Second
 	defaultQuantization                      = 5 * time.Second
 	defaultMaxRevisionStalenessPercent       = 0.1
 	defaultEnablePrometheusStats             = false
 	defaultMaxRetries                        = 8
 	defaultGCEnabled                         = true
+	defaultCredentialsProviderName           = ""
+	defaultFilterMaximumIDCount              = 100
+	defaultColumnOptimizationOption          = common.ColumnOptimizationOptionNone
+	defaultExpirationDisabled                = false
 )
 
 type mysqlOptions struct {
@@ -30,16 +37,21 @@ type mysqlOptions struct {
 	gcMaxOperationTime          time.Duration
 	maxRevisionStalenessPercent float64
 	watchBufferLength           uint16
+	watchBufferWriteTimeout     time.Duration
 	tablePrefix                 string
 	enablePrometheusStats       bool
 	maxOpenConns                int
 	connMaxIdleTime             time.Duration
 	connMaxLifetime             time.Duration
-	splitAtUsersetCount         uint16
 	analyzeBeforeStats          bool
 	maxRetries                  uint8
 	lockWaitTimeoutSeconds      *uint8
 	gcEnabled                   bool
+	credentialsProviderName     string
+	filterMaximumIDCount        uint16
+	allowedMigrations           []string
+	columnOptimizationOption    common.ColumnOptimizationOption
+	expirationDisabled          bool
 }
 
 // Option provides the facility to configure how clients within the
@@ -52,15 +64,19 @@ func generateConfig(options []Option) (mysqlOptions, error) {
 		gcInterval:                  defaultGarbageCollectionInterval,
 		gcMaxOperationTime:          defaultGarbageCollectionMaxOperationTime,
 		watchBufferLength:           defaultWatchBufferLength,
+		watchBufferWriteTimeout:     defaultWatchBufferWriteTimeout,
 		maxOpenConns:                defaultMaxOpenConns,
 		connMaxIdleTime:             defaultConnMaxIdleTime,
 		connMaxLifetime:             defaultConnMaxLifetime,
-		splitAtUsersetCount:         defaultUsersetBatchSize,
 		revisionQuantization:        defaultQuantization,
 		maxRevisionStalenessPercent: defaultMaxRevisionStalenessPercent,
 		enablePrometheusStats:       defaultEnablePrometheusStats,
 		maxRetries:                  defaultMaxRetries,
 		gcEnabled:                   defaultGCEnabled,
+		credentialsProviderName:     defaultCredentialsProviderName,
+		filterMaximumIDCount:        defaultFilterMaximumIDCount,
+		columnOptimizationOption:    defaultColumnOptimizationOption,
+		expirationDisabled:          defaultExpirationDisabled,
 	}
 
 	for _, option := range options {
@@ -76,6 +92,11 @@ func generateConfig(options []Option) (mysqlOptions, error) {
 		)
 	}
 
+	if computed.filterMaximumIDCount == 0 {
+		computed.filterMaximumIDCount = 100
+		log.Warn().Msg("filterMaximumIDCount not set, defaulting to 100")
+	}
+
 	return computed, nil
 }
 
@@ -87,6 +108,12 @@ func WatchBufferLength(watchBufferLength uint16) Option {
 	return func(mo *mysqlOptions) {
 		mo.watchBufferLength = watchBufferLength
 	}
+}
+
+// WatchBufferWriteTimeout is the maximum timeout for writing to the watch buffer,
+// after which the caller to the watch will be disconnected.
+func WatchBufferWriteTimeout(watchBufferWriteTimeout time.Duration) Option {
+	return func(mo *mysqlOptions) { mo.watchBufferWriteTimeout = watchBufferWriteTimeout }
 }
 
 // RevisionQuantization is the time bucket size to which advertised
@@ -145,16 +172,6 @@ func MaxRetries(maxRetries uint8) Option {
 func TablePrefix(prefix string) Option {
 	return func(mo *mysqlOptions) {
 		mo.tablePrefix = prefix
-	}
-}
-
-// SplitAtUsersetCount is the batch size for which userset queries will be
-// split into smaller queries.
-//
-// This defaults to 1024.
-func SplitAtUsersetCount(splitAtUsersetCount uint16) Option {
-	return func(mo *mysqlOptions) {
-		mo.splitAtUsersetCount = splitAtUsersetCount
 	}
 }
 
@@ -238,5 +255,42 @@ func GCEnabled(isGCEnabled bool) Option {
 func GCMaxOperationTime(time time.Duration) Option {
 	return func(mo *mysqlOptions) {
 		mo.gcMaxOperationTime = time
+	}
+}
+
+// CredentialsProviderName is the name of the CredentialsProvider implementation to use
+// for dynamically retrieving the datastore credentials at runtime
+//
+// Empty by default.
+func CredentialsProviderName(credentialsProviderName string) Option {
+	return func(mo *mysqlOptions) { mo.credentialsProviderName = credentialsProviderName }
+}
+
+// FilterMaximumIDCount is the maximum number of IDs that can be used to filter IDs in queries
+func FilterMaximumIDCount(filterMaximumIDCount uint16) Option {
+	return func(mo *mysqlOptions) { mo.filterMaximumIDCount = filterMaximumIDCount }
+}
+
+// AllowedMigrations configures a set of additional migrations that will pass
+// the health check (head migration is always allowed).
+func AllowedMigrations(allowedMigrations []string) Option {
+	return func(mo *mysqlOptions) { mo.allowedMigrations = allowedMigrations }
+}
+
+// WithColumnOptimization configures the column optimization strategy for the MySQL datastore.
+func WithColumnOptimization(isEnabled bool) Option {
+	return func(mo *mysqlOptions) {
+		if isEnabled {
+			mo.columnOptimizationOption = common.ColumnOptimizationOptionStaticValues
+		} else {
+			mo.columnOptimizationOption = common.ColumnOptimizationOptionNone
+		}
+	}
+}
+
+// WithExpirationDisabled disables the expiration of relationships in the MySQL datastore.
+func WithExpirationDisabled(isDisabled bool) Option {
+	return func(mo *mysqlOptions) {
+		mo.expirationDisabled = isDisabled
 	}
 }

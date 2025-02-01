@@ -16,13 +16,13 @@ import (
 	"net/url"
 	"time"
 
+	prompb "buf.build/gen/go/prometheus/prometheus/protocolbuffers/go"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
-	prompb "go.buf.build/protocolbuffers/go/prometheus/prometheus"
 
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/x509util"
@@ -164,10 +164,12 @@ func RemoteReporter(
 	}
 
 	return func(ctx context.Context) error {
-		// Smear the startup delay out over 10% of the reporting interval
+		// nolint:gosec
+		// G404 use of non cryptographically secure random number generator is not a security concern here,
+		// as this is only used to smear the startup delay out over 10% of the reporting interval
 		startupDelay := time.Duration(rand.Int63n(int64(interval.Seconds()/10))) * time.Second
 
-		log.Info().
+		log.Ctx(ctx).Info().
 			Stringer("interval", interval).
 			Str("endpoint", endpoint).
 			Stringer("next", startupDelay).
@@ -175,7 +177,8 @@ func RemoteReporter(
 
 		backoffInterval := backoff.NewExponentialBackOff()
 		backoffInterval.InitialInterval = interval
-		backoffInterval.MaxElapsedTime = MaxElapsedTimeBetweenReports
+		backoffInterval.MaxInterval = MaxElapsedTimeBetweenReports
+		backoffInterval.MaxElapsedTime = 0
 
 		// Must reset the backoff object after changing parameters
 		backoffInterval.Reset()
@@ -188,13 +191,13 @@ func RemoteReporter(
 				nextPush := backoffInterval.InitialInterval
 				if err := discoverAndWriteMetrics(ctx, registry, client, endpoint); err != nil {
 					nextPush = backoffInterval.NextBackOff()
-					log.Warn().
+					log.Ctx(ctx).Warn().
 						Err(err).
 						Str("endpoint", endpoint).
 						Stringer("next", nextPush).
 						Msg("failed to push telemetry metric")
 				} else {
-					log.Debug().
+					log.Ctx(ctx).Debug().
 						Str("endpoint", endpoint).
 						Stringer("next", nextPush).
 						Msg("reported telemetry")
@@ -216,11 +219,11 @@ func RemoteReporter(
 }
 
 func DisabledReporter(ctx context.Context) error {
-	log.Info().Msg("telemetry disabled")
+	log.Ctx(ctx).Info().Msg("telemetry disabled")
 	return nil
 }
 
-func SilentlyDisabledReporter(ctx context.Context) error {
+func SilentlyDisabledReporter(_ context.Context) error {
 	return nil
 }
 

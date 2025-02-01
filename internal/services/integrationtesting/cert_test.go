@@ -23,24 +23,27 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 
-	"github.com/authzed/spicedb/internal/datastore/memdb"
+	"github.com/authzed/spicedb/internal/datastore/dsfortesting"
 	"github.com/authzed/spicedb/internal/dispatch/graph"
-	"github.com/authzed/spicedb/internal/middleware/consistency"
 	datastoremw "github.com/authzed/spicedb/internal/middleware/datastore"
 	"github.com/authzed/spicedb/internal/middleware/servicespecific"
 	tf "github.com/authzed/spicedb/internal/testfixtures"
 	"github.com/authzed/spicedb/pkg/cmd/server"
 	"github.com/authzed/spicedb/pkg/cmd/util"
+	"github.com/authzed/spicedb/pkg/middleware/consistency"
 	"github.com/authzed/spicedb/pkg/tuple"
 	"github.com/authzed/spicedb/pkg/zedtoken"
 )
 
 func TestCertRotation(t *testing.T) {
+	t.Parallel()
+
 	const (
 		// length of time the initial cert is valid
-		initialValidDuration = 1 * time.Second
+		initialValidDuration = 3 * time.Second
+
 		// continue making requests for waitFactor*initialValidDuration
-		waitFactor = 3
+		waitFactor = 2
 	)
 
 	certDir, err := os.MkdirTemp("", "test-certs-")
@@ -112,13 +115,13 @@ func TestCertRotation(t *testing.T) {
 	require.NoError(t, certFile.Close())
 
 	// start a server with an initial set of certs
-	emptyDS, err := memdb.NewMemdbDatastore(0, 10, time.Duration(90_000_000_000_000))
+	emptyDS, err := dsfortesting.NewMemDBDatastoreForTesting(0, 10, time.Duration(90_000_000_000_000))
 	require.NoError(t, err)
 	ds, revision := tf.StandardDatastoreWithData(emptyDS, require.New(t))
 	ctx, cancel := context.WithCancel(context.Background())
-	srv, err := server.NewConfigWithOptions(
+	srv, err := server.NewConfigWithOptionsAndDefaults(
 		server.WithDatastore(ds),
-		server.WithDispatcher(graph.NewLocalOnlyDispatcher(1)),
+		server.WithDispatcher(graph.NewLocalOnlyDispatcher(1, 100)),
 		server.WithDispatchMaxDepth(50),
 		server.WithMaximumPreconditionCount(1000),
 		server.WithMaximumUpdatesPerWrite(1000),
@@ -132,22 +135,49 @@ func TestCertRotation(t *testing.T) {
 		server.WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) {
 			return ctx, nil
 		}),
-		server.WithHTTPGateway(util.HTTPServerConfig{Enabled: false}),
-		server.WithDashboardAPI(util.HTTPServerConfig{Enabled: false}),
-		server.WithMetricsAPI(util.HTTPServerConfig{Enabled: false}),
+		server.WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+		server.WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
 		server.WithDispatchServer(util.GRPCServerConfig{Enabled: false}),
+		server.SetUnaryMiddlewareModification([]server.MiddlewareModification[grpc.UnaryServerInterceptor]{
+			{
+				Operation: server.OperationReplaceAllUnsafe,
+				Middlewares: []server.ReferenceableMiddleware[grpc.UnaryServerInterceptor]{
+					{
+						Name:       "datastore",
+						Middleware: datastoremw.UnaryServerInterceptor(ds),
+					},
+					{
+						Name:       "consistency",
+						Middleware: consistency.UnaryServerInterceptor("testing"),
+					},
+					{
+						Name:       "servicespecific",
+						Middleware: servicespecific.UnaryServerInterceptor,
+					},
+				},
+			},
+		}),
+		server.SetStreamingMiddlewareModification([]server.MiddlewareModification[grpc.StreamServerInterceptor]{
+			{
+				Operation: server.OperationReplaceAllUnsafe,
+				Middlewares: []server.ReferenceableMiddleware[grpc.StreamServerInterceptor]{
+					{
+						Name:       "datastore",
+						Middleware: datastoremw.StreamServerInterceptor(ds),
+					},
+					{
+						Name:       "consistency",
+						Middleware: consistency.StreamServerInterceptor("testing"),
+					},
+					{
+						Name:       "servicespecific",
+						Middleware: servicespecific.StreamServerInterceptor,
+					},
+				},
+			},
+		}),
 	).Complete(ctx)
 	require.NoError(t, err)
-
-	srv.SetMiddleware([]grpc.UnaryServerInterceptor{
-		datastoremw.UnaryServerInterceptor(ds),
-		consistency.UnaryServerInterceptor(),
-		servicespecific.UnaryServerInterceptor,
-	}, []grpc.StreamServerInterceptor{
-		datastoremw.StreamServerInterceptor(ds),
-		consistency.StreamServerInterceptor(),
-		servicespecific.StreamServerInterceptor,
-	})
 
 	wait := make(chan struct{}, 1)
 	go func() {
@@ -155,9 +185,9 @@ func TestCertRotation(t *testing.T) {
 		wait <- struct{}{}
 	}()
 
-	// If previous code takes more than 1s to execute, the cert would have expired, and Dial would
-	// retry indefinitely, hence the context timeout
-	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+	// If previous code takes more than initialValidDuration*2 to execute, the cert
+	// would have expired, and Dial would retry indefinitely, hence the context timeout
+	dialCtx, cancelDial := context.WithTimeout(ctx, initialValidDuration*2)
 	conn, err := srv.GRPCDialContext(dialCtx,
 		grpc.WithReturnConnectionError(),
 		grpc.WithConnectParams(grpc.ConnectParams{
@@ -177,11 +207,11 @@ func TestCertRotation(t *testing.T) {
 	}()
 	// requests work with the old key
 	client := v1.NewPermissionsServiceClient(conn)
-	rel := tuple.MustToRelationship(tuple.Parse(tf.StandardTuples[0]))
+	rel := tuple.ToV1Relationship(tuple.MustParse(tf.StandardRelationships[0]))
 	_, err = client.CheckPermission(ctx, &v1.CheckPermissionRequest{
 		Consistency: &v1.Consistency{
 			Requirement: &v1.Consistency_AtLeastAsFresh{
-				AtLeastAsFresh: zedtoken.NewFromRevision(revision),
+				AtLeastAsFresh: zedtoken.MustNewFromRevision(revision),
 			},
 		},
 		Resource:   rel.Resource,
@@ -229,12 +259,12 @@ func TestCertRotation(t *testing.T) {
 	}))
 	require.NoError(t, certFile.Close())
 
-	// check for three seconds (initial cert is only valid for 1 second)
+	// check for waitFactor*initialValidDuration seconds
 	for i := 0; i < waitFactor; i++ {
 		_, err = client.CheckPermission(ctx, &v1.CheckPermissionRequest{
 			Consistency: &v1.Consistency{
 				Requirement: &v1.Consistency_AtLeastAsFresh{
-					AtLeastAsFresh: zedtoken.NewFromRevision(revision),
+					AtLeastAsFresh: zedtoken.MustNewFromRevision(revision),
 				},
 			},
 			Resource:   rel.Resource,
@@ -250,7 +280,7 @@ func TestCertRotation(t *testing.T) {
 	select {
 	case <-wait:
 		return
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		require.Fail(t, "ungraceful server termination")
 	}
 	goleak.VerifyNone(t, goleak.IgnoreCurrent())

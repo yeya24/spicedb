@@ -1,17 +1,20 @@
 package testutil
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/maps"
 
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 	"github.com/authzed/spicedb/pkg/tuple"
-	"github.com/authzed/spicedb/pkg/util"
 )
 
 // WrapFoundSubject wraps the given subject into a pointer to it, unless nil, in which case this method returns
@@ -32,7 +35,7 @@ func FoundSubject(subjectID string) *v1.FoundSubject {
 }
 
 // CaveatedFoundSubject returns a FoundSubject with the given ID and caveat expression.
-func CaveatedFoundSubject(subjectID string, expr *v1.CaveatExpression) *v1.FoundSubject {
+func CaveatedFoundSubject(subjectID string, expr *core.CaveatExpression) *v1.FoundSubject {
 	return &v1.FoundSubject{
 		SubjectId:        subjectID,
 		CaveatExpression: expr,
@@ -40,7 +43,7 @@ func CaveatedFoundSubject(subjectID string, expr *v1.CaveatExpression) *v1.Found
 }
 
 // CaveatedWildcard returns a wildcard FoundSubject with the given caveat expression and exclusions.
-func CaveatedWildcard(expr *v1.CaveatExpression, exclusions ...*v1.FoundSubject) *v1.FoundSubject {
+func CaveatedWildcard(expr *core.CaveatExpression, exclusions ...*v1.FoundSubject) *v1.FoundSubject {
 	return &v1.FoundSubject{
 		SubjectId:        tuple.PublicWildcard,
 		ExcludedSubjects: exclusions,
@@ -65,12 +68,14 @@ func Wildcard(exclusions ...string) *v1.FoundSubject {
 
 // RequireEquivalentSets requires that the given sets of subjects are equivalent.
 func RequireEquivalentSets(t *testing.T, expected []*v1.FoundSubject, found []*v1.FoundSubject) {
+	t.Helper()
 	err := CheckEquivalentSets(expected, found)
-	require.NoError(t, err, "found different subject sets: %v", err)
+	require.NoError(t, err, "found different subject sets: %v \n %v", err, found)
 }
 
 // RequireExpectedSubject requires that the given expected and produced subjects match.
 func RequireExpectedSubject(t *testing.T, expected *v1.FoundSubject, produced **v1.FoundSubject) {
+	t.Helper()
 	if expected == nil {
 		require.Nil(t, produced)
 	} else {
@@ -88,8 +93,8 @@ func CheckEquivalentSets(expected []*v1.FoundSubject, found []*v1.FoundSubject) 
 		return fmt.Errorf("found mismatch in number of elements:\n\texpected: %s\n\tfound: %s", FormatSubjects(expected), FormatSubjects(found))
 	}
 
-	sort.Sort(sortByID(expected))
-	sort.Sort(sortByID(found))
+	slices.SortFunc(expected, CmpSubjects)
+	slices.SortFunc(found, CmpSubjects)
 
 	for index := range expected {
 		err := CheckEquivalentSubjects(expected[index], found[index])
@@ -156,7 +161,7 @@ func FormatSubject(sub *v1.FoundSubject) string {
 }
 
 // formatCaveatExpr formats a caveat expression (which can be nil) into a human readable string.
-func formatCaveatExpr(expr *v1.CaveatExpression) string {
+func formatCaveatExpr(expr *core.CaveatExpression) string {
 	if expr == nil {
 		return "[nil]"
 	}
@@ -166,19 +171,19 @@ func formatCaveatExpr(expr *v1.CaveatExpression) string {
 	}
 
 	switch expr.GetOperation().Op {
-	case v1.CaveatOperation_AND:
+	case core.CaveatOperation_AND:
 		return fmt.Sprintf("(%s) && (%s)",
 			formatCaveatExpr(expr.GetOperation().GetChildren()[0]),
 			formatCaveatExpr(expr.GetOperation().GetChildren()[1]),
 		)
 
-	case v1.CaveatOperation_OR:
+	case core.CaveatOperation_OR:
 		return fmt.Sprintf("(%s) || (%s)",
 			formatCaveatExpr(expr.GetOperation().GetChildren()[0]),
 			formatCaveatExpr(expr.GetOperation().GetChildren()[1]),
 		)
 
-	case v1.CaveatOperation_NOT:
+	case core.CaveatOperation_NOT:
 		return fmt.Sprintf("!(%s)",
 			formatCaveatExpr(expr.GetOperation().GetChildren()[0]),
 		)
@@ -189,7 +194,7 @@ func formatCaveatExpr(expr *v1.CaveatExpression) string {
 }
 
 // checkEquivalentCaveatExprs checks if the given caveat expressions are equivalent and returns an error if they are not.
-func checkEquivalentCaveatExprs(expected *v1.CaveatExpression, found *v1.CaveatExpression) error {
+func checkEquivalentCaveatExprs(expected *core.CaveatExpression, found *core.CaveatExpression) error {
 	if expected == nil {
 		if found != nil {
 			return fmt.Errorf("found non-nil caveat expression `%s` where expected nil", formatCaveatExpr(found))
@@ -208,14 +213,22 @@ func checkEquivalentCaveatExprs(expected *v1.CaveatExpression, found *v1.CaveatE
 	// so we compare by building a boolean table for each referenced caveat name and then checking all combinations
 	// of boolean inputs to ensure the expressions produce the same output. Note that while this isn't the most
 	// efficient means of comparison, it is logically correct.
-	referencedNamesSet := util.NewSet[string]()
+	referencedNamesSet := mapz.NewSet[string]()
 	collectReferencedNames(expected, referencedNamesSet)
 	collectReferencedNames(found, referencedNamesSet)
 
 	referencedNames := referencedNamesSet.AsSlice()
 	for _, values := range combinatorialValues(referencedNames) {
-		expectedResult := executeCaveatExprForTesting(expected, values)
-		foundResult := executeCaveatExprForTesting(found, values)
+		expectedResult, err := executeCaveatExprForTesting(expected, values)
+		if err != nil {
+			return err
+		}
+
+		foundResult, err := executeCaveatExprForTesting(found, values)
+		if err != nil {
+			return err
+		}
+
 		if expectedResult != foundResult {
 			return fmt.Errorf("found difference between caveats for values:\n\tvalues: %v\n\texpected caveat: %s\n\tfound caveat:%s", values, formatCaveatExpr(expected), formatCaveatExpr(found))
 		}
@@ -225,32 +238,59 @@ func checkEquivalentCaveatExprs(expected *v1.CaveatExpression, found *v1.CaveatE
 
 // executeCaveatExprForTesting "executes" the given caveat expression for testing. DO NOT USE OUTSIDE OF TESTING.
 // This method *ignores* caveat context and treats each caveat as just its name.
-func executeCaveatExprForTesting(expr *v1.CaveatExpression, values map[string]bool) bool {
+func executeCaveatExprForTesting(expr *core.CaveatExpression, values map[string]bool) (bool, error) {
 	if expr.GetCaveat() != nil {
-		return values[expr.GetCaveat().CaveatName]
+		return values[expr.GetCaveat().CaveatName], nil
 	}
 
 	switch expr.GetOperation().Op {
-	case v1.CaveatOperation_AND:
+	case core.CaveatOperation_AND:
 		if len(expr.GetOperation().Children) != 2 {
-			panic("found invalid child count for AND")
+			return false, spiceerrors.MustBugf("found invalid child count for AND")
 		}
-		return executeCaveatExprForTesting(expr.GetOperation().Children[0], values) && executeCaveatExprForTesting(expr.GetOperation().Children[1], values)
 
-	case v1.CaveatOperation_OR:
+		left, err := executeCaveatExprForTesting(expr.GetOperation().Children[0], values)
+		if err != nil {
+			return false, err
+		}
+
+		right, err := executeCaveatExprForTesting(expr.GetOperation().Children[1], values)
+		if err != nil {
+			return false, err
+		}
+
+		return left && right, nil
+
+	case core.CaveatOperation_OR:
 		if len(expr.GetOperation().Children) != 2 {
-			panic("found invalid child count for OR")
+			return false, spiceerrors.MustBugf("found invalid child count for OR")
 		}
-		return executeCaveatExprForTesting(expr.GetOperation().Children[0], values) || executeCaveatExprForTesting(expr.GetOperation().Children[1], values)
 
-	case v1.CaveatOperation_NOT:
+		left, err := executeCaveatExprForTesting(expr.GetOperation().Children[0], values)
+		if err != nil {
+			return false, err
+		}
+
+		right, err := executeCaveatExprForTesting(expr.GetOperation().Children[1], values)
+		if err != nil {
+			return false, err
+		}
+
+		return left || right, nil
+
+	case core.CaveatOperation_NOT:
 		if len(expr.GetOperation().Children) != 1 {
-			panic("found invalid child count for NOT")
+			return false, spiceerrors.MustBugf("found invalid child count for NOT")
 		}
-		return !executeCaveatExprForTesting(expr.GetOperation().Children[0], values)
+
+		result, err := executeCaveatExprForTesting(expr.GetOperation().Children[0], values)
+		if err != nil {
+			return false, err
+		}
+		return !result, nil
 
 	default:
-		panic("unknown op")
+		return false, spiceerrors.MustBugf("unknown caveat operation")
 	}
 }
 
@@ -284,9 +324,9 @@ func combinatorialValues(names []string) []map[string]bool {
 }
 
 // collectReferencedNames collects all referenced caveat names into the given set.
-func collectReferencedNames(expr *v1.CaveatExpression, nameSet *util.Set[string]) {
+func collectReferencedNames(expr *core.CaveatExpression, nameSet *mapz.Set[string]) {
 	if expr.GetCaveat() != nil {
-		nameSet.Add(expr.GetCaveat().CaveatName)
+		nameSet.Insert(expr.GetCaveat().CaveatName)
 		return
 	}
 
@@ -295,8 +335,7 @@ func collectReferencedNames(expr *v1.CaveatExpression, nameSet *util.Set[string]
 	}
 }
 
-type sortByID []*v1.FoundSubject
-
-func (a sortByID) Len() int           { return len(a) }
-func (a sortByID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a sortByID) Less(i, j int) bool { return strings.Compare(a[i].SubjectId, a[j].SubjectId) < 0 }
+// CmpSubjects compares FoundSubjects such that they can be sorted.
+func CmpSubjects(a, b *v1.FoundSubject) int {
+	return cmp.Compare(a.SubjectId, b.SubjectId)
+}

@@ -1,6 +1,8 @@
 package services
 
 import (
+	"time"
+
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/authzed/grpcutil"
 	"google.golang.org/grpc"
@@ -37,16 +39,10 @@ const (
 
 	// WatchServiceEnabled indicates that the V1 watch service is enabled.
 	WatchServiceEnabled WatchServiceOption = 1
-
-	// CaveatsDisabled indicates that caveats are disabled.
-	CaveatsDisabled CaveatsOption = 0
-
-	// CaveatsEnabled indicates that caveats are enabled.
-	CaveatsEnabled CaveatsOption = 1
 )
 
 const (
-	// Empty string is used for grpc health check requests for the overall system.
+	// OverallServerHealthCheckKey is used for grpc health check requests for the overall system.
 	OverallServerHealthCheckKey = ""
 )
 
@@ -57,21 +53,22 @@ func RegisterGrpcServices(
 	dispatch dispatch.Dispatcher,
 	schemaServiceOption SchemaServiceOption,
 	watchServiceOption WatchServiceOption,
-	caveatsOption CaveatsOption,
 	permSysConfig v1svc.PermissionsServerConfig,
+	watchHeartbeatDuration time.Duration,
 ) {
 	healthManager.RegisterReportedService(OverallServerHealthCheckKey)
 
-	v1.RegisterPermissionsServiceServer(srv, v1svc.NewPermissionsServer(dispatch, permSysConfig, caveatsOption == CaveatsEnabled))
+	v1.RegisterPermissionsServiceServer(srv, v1svc.NewPermissionsServer(dispatch, permSysConfig))
+	v1.RegisterExperimentalServiceServer(srv, v1svc.NewExperimentalServer(dispatch, permSysConfig))
 	healthManager.RegisterReportedService(v1.PermissionsService_ServiceDesc.ServiceName)
 
 	if watchServiceOption == WatchServiceEnabled {
-		v1.RegisterWatchServiceServer(srv, v1svc.NewWatchServer())
+		v1.RegisterWatchServiceServer(srv, v1svc.NewWatchServer(watchHeartbeatDuration))
 		healthManager.RegisterReportedService(v1.WatchService_ServiceDesc.ServiceName)
 	}
 
 	if schemaServiceOption == V1SchemaServiceEnabled || schemaServiceOption == V1SchemaServiceAdditiveOnly {
-		v1.RegisterSchemaServiceServer(srv, v1svc.NewSchemaServer(schemaServiceOption == V1SchemaServiceAdditiveOnly, caveatsOption == CaveatsEnabled))
+		v1.RegisterSchemaServiceServer(srv, v1svc.NewSchemaServer(schemaServiceOption == V1SchemaServiceAdditiveOnly, permSysConfig.ExpiringRelationshipsEnabled))
 		healthManager.RegisterReportedService(v1.SchemaService_ServiceDesc.ServiceName)
 	}
 

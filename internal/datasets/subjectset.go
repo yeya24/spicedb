@@ -1,6 +1,7 @@
 package datasets
 
 import (
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 )
 
@@ -15,7 +16,7 @@ type SubjectSet struct {
 // NewSubjectSet creates and returns a new subject set.
 func NewSubjectSet() SubjectSet {
 	return SubjectSet{
-		BaseSubjectSet: NewBaseSubjectSet[*v1.FoundSubject](subjectSetConstructor),
+		BaseSubjectSet: NewBaseSubjectSet(subjectSetConstructor),
 	}
 }
 
@@ -23,17 +24,29 @@ func (ss SubjectSet) SubtractAll(other SubjectSet) {
 	ss.BaseSubjectSet.SubtractAll(other.BaseSubjectSet)
 }
 
-func (ss SubjectSet) IntersectionDifference(other SubjectSet) {
-	ss.BaseSubjectSet.IntersectionDifference(other.BaseSubjectSet)
+func (ss SubjectSet) MustIntersectionDifference(other SubjectSet) {
+	ss.BaseSubjectSet.MustIntersectionDifference(other.BaseSubjectSet)
 }
 
-func (ss SubjectSet) UnionWithSet(other SubjectSet) {
-	ss.BaseSubjectSet.UnionWithSet(other.BaseSubjectSet)
+func (ss SubjectSet) IntersectionDifference(other SubjectSet) error {
+	return ss.BaseSubjectSet.IntersectionDifference(other.BaseSubjectSet)
+}
+
+func (ss SubjectSet) MustUnionWithSet(other SubjectSet) {
+	ss.BaseSubjectSet.MustUnionWithSet(other.BaseSubjectSet)
+}
+
+func (ss SubjectSet) Clone() SubjectSet {
+	return SubjectSet{ss.BaseSubjectSet.Clone()}
+}
+
+func (ss SubjectSet) UnionWithSet(other SubjectSet) error {
+	return ss.BaseSubjectSet.UnionWithSet(other.BaseSubjectSet)
 }
 
 // WithParentCaveatExpression returns a copy of the subject set with the parent caveat expression applied
 // to all members of this set.
-func (ss SubjectSet) WithParentCaveatExpression(parentCaveatExpr *v1.CaveatExpression) SubjectSet {
+func (ss SubjectSet) WithParentCaveatExpression(parentCaveatExpr *core.CaveatExpression) SubjectSet {
 	return SubjectSet{ss.BaseSubjectSet.WithParentCaveatExpression(parentCaveatExpr)}
 }
 
@@ -43,7 +56,7 @@ func (ss SubjectSet) AsFoundSubjects() *v1.FoundSubjects {
 	}
 }
 
-func subjectSetConstructor(subjectID string, caveatExpression *v1.CaveatExpression, excludedSubjects []*v1.FoundSubject, sources ...*v1.FoundSubject) *v1.FoundSubject {
+func subjectSetConstructor(subjectID string, caveatExpression *core.CaveatExpression, excludedSubjects []*v1.FoundSubject, _ ...*v1.FoundSubject) *v1.FoundSubject {
 	return &v1.FoundSubject{
 		SubjectId:        subjectID,
 		CaveatExpression: caveatExpression,

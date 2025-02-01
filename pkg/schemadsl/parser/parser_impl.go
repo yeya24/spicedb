@@ -10,17 +10,16 @@ import (
 
 // AstNode defines an interface for working with nodes created by this parser.
 type AstNode interface {
-	// Connect connects this AstNode to another AstNode with the given predicate,
-	// and returns the same AstNode.
-	Connect(predicate string, other AstNode) AstNode
+	// Connect connects this AstNode to another AstNode with the given predicate.
+	Connect(predicate string, other AstNode)
 
-	// Decorate decorates this AstNode with the given property and string value,
-	// and returns the same AstNode.
-	Decorate(property string, value string) AstNode
+	// MustDecorate decorates this AstNode with the given property and string value, returning
+	// the same node.
+	MustDecorate(property string, value string) AstNode
 
-	// Decorate decorates this AstNode with the given property and int value,
-	// and returns the same AstNode.
-	DecorateWithInt(property string, value int) AstNode
+	// MustDecorateWithInt decorates this AstNode with the given property and int value, returning
+	// the same node.
+	MustDecorateWithInt(property string, value int) AstNode
 }
 
 // NodeBuilder is a function for building AST nodes.
@@ -45,18 +44,18 @@ type commentedLexeme struct {
 
 // sourceParser holds the state of the parser.
 type sourceParser struct {
-	source        input.Source         // the name of the input; used only for error reports
-	input         string               // the input string itself
-	lex           *lexer.PeekableLexer // a reference to the lexer used for tokenization
-	builder       NodeBuilder          // the builder function for creating AstNode instances
-	nodes         *nodeStack           // the stack of the current nodes
-	currentToken  commentedLexeme      // the current token
-	previousToken commentedLexeme      // the previous token
+	source        input.Source           // the name of the input; used only for error reports
+	input         string                 // the input string itself
+	lex           *lexer.FlaggableLexler // a reference to the lexer used for tokenization
+	builder       NodeBuilder            // the builder function for creating AstNode instances
+	nodes         *nodeStack             // the stack of the current nodes
+	currentToken  commentedLexeme        // the current token
+	previousToken commentedLexeme        // the previous token
 }
 
 // buildParser returns a new sourceParser instance.
 func buildParser(lx *lexer.Lexer, builder NodeBuilder, source input.Source, input string) *sourceParser {
-	l := lexer.NewPeekableLexer(lx)
+	l := lexer.NewFlaggableLexler(lx)
 	return &sourceParser{
 		source:        source,
 		input:         input,
@@ -80,8 +79,8 @@ func (p *sourceParser) createNode(kind dslshape.NodeType) AstNode {
 // createErrorNodef creates a new error node and returns it.
 func (p *sourceParser) createErrorNodef(format string, args ...interface{}) AstNode {
 	message := fmt.Sprintf(format, args...)
-	node := p.startNode(dslshape.NodeTypeError).Decorate(dslshape.NodePredicateErrorMessage, message)
-	p.finishNode()
+	node := p.startNode(dslshape.NodeTypeError).MustDecorate(dslshape.NodePredicateErrorMessage, message)
+	p.mustFinishNode()
 	return node
 }
 
@@ -97,8 +96,8 @@ func (p *sourceParser) startNode(kind dslshape.NodeType) AstNode {
 // decorateStartRuneAndComments decorates the given node with the location of the given token as its
 // starting rune, as well as any comments attached to the token.
 func (p *sourceParser) decorateStartRuneAndComments(node AstNode, token commentedLexeme) {
-	node.Decorate(dslshape.NodePredicateSource, string(p.source))
-	node.DecorateWithInt(dslshape.NodePredicateStartRune, int(token.Position))
+	node.MustDecorate(dslshape.NodePredicateSource, string(p.source))
+	node.MustDecorateWithInt(dslshape.NodePredicateStartRune, int(token.Position))
 	p.decorateComments(node, token.comments)
 }
 
@@ -106,7 +105,7 @@ func (p *sourceParser) decorateStartRuneAndComments(node AstNode, token commente
 func (p *sourceParser) decorateComments(node AstNode, comments []string) {
 	for _, comment := range comments {
 		commentNode := p.createNode(dslshape.NodeTypeComment)
-		commentNode.Decorate(dslshape.NodeCommentPredicateValue, comment)
+		commentNode.MustDecorate(dslshape.NodeCommentPredicateValue, comment)
 		node.Connect(dslshape.NodePredicateChild, commentNode)
 	}
 }
@@ -115,7 +114,7 @@ func (p *sourceParser) decorateComments(node AstNode, comments []string) {
 // ending rune.
 func (p *sourceParser) decorateEndRune(node AstNode, token commentedLexeme) {
 	position := int(token.Position) + len(token.Value) - 1
-	node.DecorateWithInt(dslshape.NodePredicateEndRune, position)
+	node.MustDecorateWithInt(dslshape.NodePredicateEndRune, position)
 }
 
 // currentNode returns the node at the top of the stack.
@@ -123,9 +122,9 @@ func (p *sourceParser) currentNode() AstNode {
 	return p.nodes.topValue()
 }
 
-// finishNode pops the current node from the top of the stack and decorates it with
+// mustFinishNode pops the current node from the top of the stack and decorates it with
 // the current token's end position as its end position.
-func (p *sourceParser) finishNode() {
+func (p *sourceParser) mustFinishNode() {
 	if p.currentNode() == nil {
 		panic(fmt.Sprintf("No current node on stack. Token: %s", p.currentToken.Value))
 	}
@@ -164,6 +163,11 @@ func (p *sourceParser) isToken(types ...lexer.TokenType) bool {
 	return false
 }
 
+// isIdentifier returns true if the current token is an identifier matching that given.
+func (p *sourceParser) isIdentifier(identifier string) bool {
+	return p.isToken(lexer.TokenTypeIdentifier) && p.currentToken.Value == identifier
+}
+
 // isKeyword returns true if the current token is a keyword matching that given.
 func (p *sourceParser) isKeyword(keyword string) bool {
 	return p.isToken(lexer.TokenTypeKeyword) && p.currentToken.Value == keyword
@@ -174,9 +178,21 @@ func (p *sourceParser) isKeyword(keyword string) bool {
 func (p *sourceParser) emitErrorf(format string, args ...interface{}) {
 	errorNode := p.createErrorNodef(format, args...)
 	if len(p.currentToken.Value) > 0 {
-		errorNode.Decorate(dslshape.NodePredicateErrorSource, p.currentToken.Value)
+		errorNode.MustDecorate(dslshape.NodePredicateErrorSource, p.currentToken.Value)
 	}
 	p.currentNode().Connect(dslshape.NodePredicateChild, errorNode)
+}
+
+// consumeVariableKeyword consumes an expected keyword token or adds an error node.
+func (p *sourceParser) consumeVariableKeyword() (string, bool) {
+	if !p.isToken(lexer.TokenTypeKeyword) {
+		p.emitErrorf("Expected keyword, found token %v", p.currentToken.Kind)
+		return "", false
+	}
+
+	token := p.currentToken
+	p.consumeToken()
+	return token.Value, true
 }
 
 // consumeKeyword consumes an expected keyword token or adds an error node.
@@ -246,8 +262,7 @@ func (p *sourceParser) tryConsumeWithComments(types ...lexer.TokenType) (comment
 // properly handles decoration of the nodes with their proper start and end run locations and
 // comments.
 func (p *sourceParser) performLeftRecursiveParsing(subTryExprFn tryParserFn, rightNodeBuilder rightNodeConstructor, rightTokenTester lookaheadParserFn, operatorTokens ...lexer.TokenType) (AstNode, bool) {
-	var currentLeftToken commentedLexeme
-	currentLeftToken = p.currentToken
+	leftMostToken := p.currentToken
 
 	// Consume the left side of the expression.
 	leftNode, ok := subTryExprFn()
@@ -291,11 +306,10 @@ func (p *sourceParser) performLeftRecursiveParsing(subTryExprFn tryParserFn, rig
 			return currentLeftNode, true
 		}
 
-		p.decorateStartRuneAndComments(exprNode, currentLeftToken)
+		p.decorateStartRuneAndComments(exprNode, leftMostToken)
 		p.decorateEndRune(exprNode, p.previousToken)
 
 		currentLeftNode = exprNode
-		currentLeftToken = operatorToken
 	}
 
 	return currentLeftNode, true

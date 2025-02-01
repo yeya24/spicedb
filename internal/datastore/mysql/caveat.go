@@ -7,12 +7,11 @@ import (
 	"fmt"
 
 	"github.com/authzed/spicedb/internal/datastore/common"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
 	"github.com/authzed/spicedb/pkg/datastore"
-	"github.com/authzed/spicedb/pkg/datastore/revision"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 
 	sq "github.com/Masterminds/squirrel"
-	"github.com/shopspring/decimal"
 )
 
 const (
@@ -23,7 +22,7 @@ const (
 )
 
 func (mr *mysqlReader) ReadCaveatByName(ctx context.Context, name string) (*core.CaveatDefinition, datastore.Revision, error) {
-	filteredReadCaveat := mr.filterer(mr.ReadCaveatQuery)
+	filteredReadCaveat := mr.aliveFilter(mr.ReadCaveatQuery)
 	sqlStatement, args, err := filteredReadCaveat.Where(sq.Eq{colName: name}).ToSql()
 	if err != nil {
 		return nil, datastore.NoRevision, err
@@ -36,8 +35,8 @@ func (mr *mysqlReader) ReadCaveatByName(ctx context.Context, name string) (*core
 	defer common.LogOnError(ctx, txCleanup)
 
 	var serializedDef []byte
-	var rev decimal.Decimal
-	err = tx.QueryRowContext(ctx, sqlStatement, args...).Scan(&serializedDef, &rev)
+	var txID uint64
+	err = tx.QueryRowContext(ctx, sqlStatement, args...).Scan(&serializedDef, &txID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, datastore.NoRevision, datastore.NewCaveatNameNotFoundErr(name)
@@ -49,16 +48,27 @@ func (mr *mysqlReader) ReadCaveatByName(ctx context.Context, name string) (*core
 	if err != nil {
 		return nil, datastore.NoRevision, fmt.Errorf(errReadCaveat, err)
 	}
-	return &def, revision.NewFromDecimal(rev), nil
+	return &def, revisions.NewForTransactionID(txID), nil
 }
 
-func (mr *mysqlReader) ListCaveats(ctx context.Context, caveatNames ...string) ([]*core.CaveatDefinition, error) {
+func (mr *mysqlReader) LookupCaveatsWithNames(ctx context.Context, caveatNames []string) ([]datastore.RevisionedCaveat, error) {
+	if len(caveatNames) == 0 {
+		return nil, nil
+	}
+	return mr.lookupCaveats(ctx, caveatNames)
+}
+
+func (mr *mysqlReader) ListAllCaveats(ctx context.Context) ([]datastore.RevisionedCaveat, error) {
+	return mr.lookupCaveats(ctx, nil)
+}
+
+func (mr *mysqlReader) lookupCaveats(ctx context.Context, caveatNames []string) ([]datastore.RevisionedCaveat, error) {
 	caveatsWithNames := mr.ListCaveatsQuery
 	if len(caveatNames) > 0 {
 		caveatsWithNames = caveatsWithNames.Where(sq.Eq{colName: caveatNames})
 	}
 
-	filteredListCaveat := mr.filterer(caveatsWithNames)
+	filteredListCaveat := mr.aliveFilter(caveatsWithNames)
 	listSQL, listArgs, err := filteredListCaveat.ToSql()
 	if err != nil {
 		return nil, err
@@ -76,10 +86,12 @@ func (mr *mysqlReader) ListCaveats(ctx context.Context, caveatNames ...string) (
 	}
 	defer common.LogOnError(ctx, rows.Close)
 
-	var caveats []*core.CaveatDefinition
+	var caveats []datastore.RevisionedCaveat
 	for rows.Next() {
 		var defBytes []byte
-		err = rows.Scan(&defBytes)
+		var txID uint64
+
+		err = rows.Scan(&defBytes, &txID)
 		if err != nil {
 			return nil, fmt.Errorf(errListCaveats, err)
 		}
@@ -88,7 +100,10 @@ func (mr *mysqlReader) ListCaveats(ctx context.Context, caveatNames ...string) (
 		if err != nil {
 			return nil, fmt.Errorf(errListCaveats, err)
 		}
-		caveats = append(caveats, &c)
+		caveats = append(caveats, datastore.RevisionedCaveat{
+			Definition:          &c,
+			LastWrittenRevision: revisions.NewForTransactionID(txID),
+		})
 	}
 	if rows.Err() != nil {
 		return nil, fmt.Errorf(errListCaveats, rows.Err())
